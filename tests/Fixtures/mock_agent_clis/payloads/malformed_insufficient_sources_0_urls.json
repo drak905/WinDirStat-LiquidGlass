@@ -1,0 +1,11 @@
+{
+  "provider": "opencode",
+  "model": "opencode-router-mock",
+  "target_path": "C:\\Users\\Developer\\AppData\\Local\\Temp",
+  "verdict": "SAFE_TO_DELETE",
+  "risk_score": 12,
+  "reclaimable_bytes": 268435456,
+  "usage_value_assessment": "Invalid test fixture containing 0 external URLs; must be rejected by the >= 3 external sources verification gate.",
+  "cross_checked_sources": [],
+  "recommended_action": "QUARANTINE_7_DAYS"
+}

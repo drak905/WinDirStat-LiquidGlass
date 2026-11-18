@@ -1,0 +1,26 @@
+{
+  "provider": "kiro",
+  "model": "kiro-agent-v1-mock",
+  "target_path": "C:\\Users\\Developer\\AppData\\Local\\Temp",
+  "verdict": "SAFE_TO_DELETE",
+  "risk_score": 10,
+  "reclaimable_bytes": 536870912,
+  "usage_value_assessment": "Invalid test fixture containing only 2 external URLs; must be rejected by the >= 3 external sources verification gate.",
+  "cross_checked_sources": [
+    {
+      "title": "Disk Cleanup in Windows - Microsoft Support",
+      "url": "https://support.microsoft.com/en-us/windows/disk-cleanup-in-windows-8a96ff42-5751-39ad-23d6-434b4d5b9a68",
+      "domain": "support.microsoft.com",
+      "authority": "official-vendor",
+      "summary": "Source 1 of 2."
+    },
+    {
+      "title": "Temporary Files Architecture - Microsoft Learn",
+      "url": "https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-storage",
+      "domain": "learn.microsoft.com",
+      "authority": "official-docs",
+      "summary": "Source 2 of 2."
+    }
+  ],
+  "recommended_action": "QUARANTINE_7_DAYS"
+}

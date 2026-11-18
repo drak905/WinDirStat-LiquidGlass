@@ -1,0 +1,214 @@
+name: WinDirStat Liquid Glass CI & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CI: true
+
+jobs:
+  verify-and-release:
+    name: Windows 4-Tier TDD & Release Pipeline
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository (full history for GitRevision & Gitleaks)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Security Gate - Install & Run Gitleaks Secret Scan
+        run: |
+          if (-not (Get-Command gitleaks -ErrorAction SilentlyContinue)) {
+            choco install gitleaks -y --no-progress
+          }
+          gitleaks version
+          gitleaks detect --source . --no-git --verbose
+          if ($LASTEXITCODE -ne 0) { throw "Gitleaks workspace scan failed." }
+
+          if ((Test-Path '.gitleaksignore') -or (Test-Path '.gitleaks.toml')) {
+            gitleaks detect --source . --verbose
+          } else {
+            git merge-base --is-ancestor 882d9ea6 HEAD 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              gitleaks detect --source . --log-opts="882d9ea6..HEAD" --verbose
+            } else {
+              gitleaks detect --source . --log-opts="-n 50" --verbose
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Gitleaks commit history scan failed." }
+
+      - name: Setup Rust Toolchain (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup Node.js LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup MSBuild (Visual Studio C++23)
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Verify Synthetic 100k Tree & Mock Agent CLIs
+        run: |
+          node tests/fixtures/generate_synthetic_tree.mjs --verify
+          if ($LASTEXITCODE -ne 0) { throw "Synthetic tree verification failed." }
+          node tests/fixtures/generate_synthetic_tree.mjs --count 100000 --out tests/fixtures/synthetic-tree-100k.json
+          if ($LASTEXITCODE -ne 0) { throw "Synthetic 100k tree generation failed." }
+          node tests/fixtures/mock_agent_clis/mock_agent_responder.mjs --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Mock Agent CLI self-test failed." }
+
+      - name: Tier 1A - Build WinDirStat C++23 Solution & Run IpcStreamerTests
+        run: |
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          if (-not $vsInstall) { throw "Visual Studio C++ BuildTools not found on runner." }
+
+          $hasV145 = $null -ne (Get-ChildItem -Path $vsInstall -Directory -Filter 'v145' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+          $msbuildArgs = @('windirstat.sln', '/p:Configuration=Release', '/p:Platform=x64', '/m')
+          if (-not $hasV145) {
+            Write-Host "Toolset v145 unavailable on runner; building with PlatformToolset=v143."
+            $msbuildArgs += '/p:PlatformToolset=v143'
+          }
+          msbuild @msbuildArgs
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
+
+          if (Test-Path 'tests/IpcStreamerTests.cpp') {
+            $vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
+            $testExe = Join-Path $env:RUNNER_TEMP 'wds_ipc_tests.exe'
+            $cmdLine = "`"$vsDevCmd`" -arch=amd64 -no_logo && cl.exe /nologo /std:c++23 /EHsc /Iwindirstat tests\IpcStreamerTests.cpp /Fe:`"$testExe`" && `"$testExe`""
+            cmd.exe /c $cmdLine
+            if ($LASTEXITCODE -ne 0) { throw "C++23 IpcStreamerTests failed with exit code $LASTEXITCODE" }
+          }
+
+      - name: Install & Build Frontend Assets (Tauri frontendDist Prerequisite)
+        working-directory: src-ui
+        run: |
+          pnpm install
+          if ($LASTEXITCODE -ne 0) { throw "pnpm install failed." }
+          pnpm build
+          if ($LASTEXITCODE -ne 0) { throw "pnpm build failed." }
+
+      - name: Tier 1B - Rust Core Unit Tests
+        working-directory: src-tauri
+        run: cargo test --lib -- --nocapture
+
+      - name: Tier 2 - Agent CLI Integration & >=3 Source Gate
+        working-directory: src-tauri
+        env:
+          WDS_FIXTURES_DIR: ${{ github.workspace }}\tests\fixtures
+          WDS_MOCK_AGENT_BIN: ${{ github.workspace }}\tests\fixtures\mock_agent_clis\bin
+        run: cargo test --test agent_cli_integration -- --nocapture
+
+      - name: Tier 3 - 7-Day Quarantine Vault Chaos Suite & Build wds-vault
+        working-directory: src-tauri
+        run: |
+          cargo test --test vault_chaos_suite -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "vault_chaos_suite failed." }
+          cargo build --release --bin wds-vault
+          if ($LASTEXITCODE -ne 0) { throw "Building release binary wds-vault failed." }
+
+      - name: Tier 4 - Frontend Vitest & Playwright E2E
+        working-directory: src-ui
+        env:
+          WDS_FIXTURES_DIR: ${{ github.workspace }}\tests\fixtures
+          WDS_MOCK_AGENT_BIN: ${{ github.workspace }}\tests\fixtures\mock_agent_clis\bin
+        run: |
+          pnpm exec playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw "Playwright Chromium installation failed." }
+          pnpm test:unit --run
+          if ($LASTEXITCODE -ne 0) { throw "Vitest unit tests failed." }
+          pnpm test:e2e
+          if ($LASTEXITCODE -ne 0) { throw "Playwright E2E tests failed." }
+
+      - name: Upload Playwright Diagnostics on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-diagnostics
+          path: |
+            src-ui/playwright-report/
+            src-ui/test-results/
+          if-no-files-found: ignore
+
+      - name: Build Tauri Release Installer on Version Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: src-tauri
+        run: |
+          if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
+            cargo install tauri-cli --locked
+            if ($LASTEXITCODE -ne 0) { throw "Installing tauri-cli failed." }
+          }
+          cargo tauri build
+          if ($LASTEXITCODE -ne 0) { throw "cargo tauri build failed." }
+
+      - name: Stage Release Artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $stageDir = Join-Path $env:RUNNER_TEMP 'release-artifacts'
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          $vaultBin = 'src-tauri/target/release/wds-vault.exe'
+          if (-not (Test-Path $vaultBin)) { throw "Missing release artifact: $vaultBin" }
+          Copy-Item $vaultBin -Destination $stageDir
+
+          if (Test-Path 'build/WinDirStat_x64.exe') {
+            Copy-Item 'build/WinDirStat_x64.exe' -Destination $stageDir
+          }
+
+          $installers = Get-ChildItem -Path 'src-tauri/target/release/bundle' -Recurse -Include '*.exe', '*.msi' -ErrorAction SilentlyContinue
+          if (-not $installers) { throw "No Tauri installer (.exe/.msi) found under src-tauri/target/release/bundle" }
+          foreach ($inst in $installers) {
+            Copy-Item $inst.FullName -Destination $stageDir
+          }
+
+          Get-ChildItem $stageDir | Format-Table Name, Length
+
+      - name: Upload Release Artifacts to Workflow
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: windirstat-liquid-glass-${{ github.ref_name }}-windows-x64
+          path: ${{ runner.temp }}\release-artifacts\*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}\release-artifacts\*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

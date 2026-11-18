@@ -1,0 +1,40 @@
+{
+  "provider": "codex",
+  "model": "codex-gpt-5-mock",
+  "target_path": "C:\\Windows\\System32",
+  "verdict": "KEEP_CRITICAL",
+  "risk_score": 98,
+  "reclaimable_bytes": 0,
+  "usage_value_assessment": "C:\\Windows\\System32 contains core OS kernel, HAL, and Win32 subsystem libraries. Modifying or quarantining these files will render Windows unbootable.",
+  "cross_checked_sources": [
+    {
+      "title": "Windows File Protection and System32 Integrity - Microsoft Learn",
+      "url": "https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/description-of-windows-file-protection",
+      "domain": "learn.microsoft.com",
+      "authority": "official-docs",
+      "summary": "Protected system binaries in System32 are guarded by Windows Resource Protection."
+    },
+    {
+      "title": "Use System File Checker (SFC) - Microsoft Support",
+      "url": "https://support.microsoft.com/en-us/topic/use-the-system-file-checker-tool-to-repair-missing-or-corrupted-system-files-79aa86cb-ca52-166a-92a3-966e85d4094e",
+      "domain": "support.microsoft.com",
+      "authority": "official-vendor",
+      "summary": "Core OS binaries must never be manually deleted or moved."
+    },
+    {
+      "title": "Manage the Component Store (WinSxS) - Microsoft Learn",
+      "url": "https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/manage-the-component-store",
+      "domain": "learn.microsoft.com",
+      "authority": "official-docs",
+      "summary": "Windows servicing relies on protected system folders; manual deletion breaks updates."
+    },
+    {
+      "title": "Architecture of Windows NT - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Architecture_of_Windows_NT",
+      "domain": "en.wikipedia.org",
+      "authority": "reference",
+      "summary": "Kernel and system DLLs reside under System32 for user/kernel transitions."
+    }
+  ],
+  "recommended_action": "KEEP_PROTECTED"
+}

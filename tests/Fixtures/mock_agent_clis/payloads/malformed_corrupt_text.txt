@@ -1,0 +1,1 @@
+{"verdict":"SAFE_TO_DELETE","cross_checked_sources":[{"url":"https://broken

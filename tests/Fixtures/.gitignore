@@ -1,0 +1,3 @@
+# Generated 100k-node performance fixture (created on demand by generate_synthetic_tree.mjs)
+synthetic-tree-100k.json
+*.100k.json
