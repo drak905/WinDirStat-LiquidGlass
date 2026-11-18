@@ -28,12 +28,31 @@ export function isTauriRuntime(): boolean {
 }
 
 async function tryTauriInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
-  if (!isTauriRuntime()) return null;
-  try {
-    return await invoke<T>(command, args);
-  } catch {
-    return null;
+  if (isTauriRuntime()) {
+    try {
+      return await invoke<T>(command, args);
+    } catch {
+      return null;
+    }
   }
+  if (
+    typeof window !== 'undefined' &&
+    (window as unknown as { __WDS_DESKTOP_EXE__?: boolean }).__WDS_DESKTOP_EXE__
+  ) {
+    try {
+      const response = await fetch('/api/invoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command, args: args ?? {} }),
+      });
+      if (!response.ok) return null;
+      const data = (await response.json()) as T | null;
+      return data ?? null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function buildSimulatedSources(targetPath: string): AgentAdvisorResponse['sources'] {

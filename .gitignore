@@ -84,3 +84,6 @@ dist/
 playwright-report/
 test-results/
 coverage/
+
+# Standalone compiled executables at repo root
+/*.exe
