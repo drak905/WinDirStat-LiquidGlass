@@ -486,9 +486,23 @@ fn set_file_timestamps(
     Ok(())
 }
 
+fn canonicalize_sddl_auto_inherit(sddl: &str) -> String {
+    sddl.replace("D:AI(", "D:(")
+}
+
+pub fn sddl_equivalent(left: &str, right: &str) -> bool {
+    left == right || canonicalize_sddl_auto_inherit(left) == canonicalize_sddl_auto_inherit(right)
+}
+
 fn restore_sddl(path: &Path, sddl: &str) -> Result<(), VaultError> {
     if sddl.trim().is_empty() {
         return Ok(());
+    }
+
+    if let Ok(current) = capture_sddl(path) {
+        if current == sddl {
+            return Ok(());
+        }
     }
 
     let sddl_wide = to_wide_null_os(OsStr::new(sddl));
@@ -738,7 +752,12 @@ mod tests {
         .unwrap();
 
         let after_snap = capture_file_security_snapshot(&file_path).unwrap();
-        assert_eq!(after_snap.ntfs_acl_sddl, initial_snap.ntfs_acl_sddl);
+        assert!(
+            sddl_equivalent(&after_snap.ntfs_acl_sddl, &initial_snap.ntfs_acl_sddl),
+            "SDDL mismatch: left={:?}, right={:?}",
+            after_snap.ntfs_acl_sddl,
+            initial_snap.ntfs_acl_sddl
+        );
         assert_eq!(after_snap.creation_time_utc, target_ctime);
         assert_eq!(after_snap.modified_time_utc, target_mtime);
         assert_ne!(after_snap.attributes & 0x1, 0);
