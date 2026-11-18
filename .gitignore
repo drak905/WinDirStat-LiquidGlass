@@ -17,3 +17,70 @@ intermediate/
 
 # Specific Files
 /windirstat/res/LangStrings.h
+
+
+# =====================================================================
+# 1. AGENT CLI CREDENTIALS, SESSION TOKENS & SECRETS (CRITICAL)
+# =====================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*credentials*.json
+*secret*.json
+*token*.json
+api_keys.*
+mcp-config.local.json
+
+# Agent CLI Local State & Auth Caches
+.antigravity/
+.kiro/
+.claude/
+.codex/
+.opencode/
+scripts/detected-agent-clis.json
+
+# =====================================================================
+# 2. WINDIRSTAT PORTABLE SETTINGS, CLOUD CREDENTIALS & QUARANTINE VAULT
+# =====================================================================
+WinDirStat.ini
+WinDirStat-portable.ini
+*cloud-connections*.json
+*s3-credentials*
+*azure-blob*
+*webdav-auth*
+.WinDirStatVault/
+vault_manifest.db
+vault_manifest.db-shm
+vault_manifest.db-wal
+*.db
+*.sqlite
+*.sqlite3
+
+# =====================================================================
+# 3. C++23 / MSVC / RUST / TAURI / NODE BUILD ARTIFACTS
+# =====================================================================
+[Bb]uild/
+[Dd]ebug/
+[Rr]elease/
+x64/
+ARM64/
+Win32/
+.vs/
+*.VC.db
+*.VC.VC.opendb
+*.user
+*.suo
+*.aps
+*.ncb
+*.Incredibuild
+target/
+node_modules/
+dist/
+playwright-report/
+test-results/
+coverage/
