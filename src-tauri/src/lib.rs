@@ -1,1 +1,2 @@
+pub mod agent_hub;
 pub mod ipc_bridge;
