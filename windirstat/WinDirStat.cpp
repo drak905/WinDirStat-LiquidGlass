@@ -9,6 +9,7 @@
 #include "AboutDlg.h"
 #include "CsvLoader.h"
 #include "FinderMtp.h"
+#include "IpcStreamer.h"
 #include "StorageSource.h"
 
 CIconHandler* GetIconHandler()
@@ -222,6 +223,7 @@ class CWinDirStatCommandLineInfo final
     static constexpr std::wstring_view saveToFlag = L"saveto";
     static constexpr std::wstring_view saveDupesToFlag = L"savedupesto";
     static constexpr std::wstring_view savePermsToFlag = L"savepermsto";
+    static constexpr std::wstring_view ipcPipeFlag = L"ipcpipe";
     static constexpr std::wstring_view loadFromFlag = L"loadfrom";
     static constexpr std::wstring_view legacyUninstallFlag = L"legacyuninstall";
     std::wstring m_path;
@@ -284,6 +286,17 @@ private:
             else if (m_pendingFlag == savePermsToFlag)
             {
                 CDirStatApp::Get()->m_savePermsToPath = param;
+            }
+            else if (m_pendingFlag == ipcPipeFlag)
+            {
+                if (const auto normalized = wds::ipc::NormalizePipePath(param))
+                {
+                    CDirStatApp::Get()->m_ipcPipePath = *normalized;
+                }
+                else
+                {
+                    m_malformedFlag = true;
+                }
             }
             else if (m_pendingFlag == loadFromFlag)
             {
@@ -351,8 +364,28 @@ private:
             m_malformedFlag = true;
             return;
         }
+        if (const auto ipcParsed = wds::ipc::ParseIpcPipeFlag(param); ipcParsed.matched)
+        {
+            if (!m_operationFlag.empty()) m_malformedFlag = true;
+            else m_operationFlag = ipcPipeFlag;
+
+            if (!ipcParsed.valid)
+            {
+                m_malformedFlag = true;
+            }
+            else if (ipcParsed.needsNextArg)
+            {
+                m_pendingFlag = ipcPipeFlag;
+                if (bLast) m_malformedFlag = true;
+            }
+            else if (ipcParsed.pipePath.has_value())
+            {
+                CDirStatApp::Get()->m_ipcPipePath = *ipcParsed.pipePath;
+            }
+            return;
+        }
         param = MakeLower(param);
-        static constexpr std::array operationFlags{ saveToFlag, saveDupesToFlag, savePermsToFlag, loadFromFlag };
+        static constexpr std::array operationFlags{ saveToFlag, saveDupesToFlag, savePermsToFlag, ipcPipeFlag, loadFromFlag };
         if (std::ranges::contains(operationFlags, param))
         {
             if (!m_operationFlag.empty()) m_malformedFlag = true;
@@ -407,7 +440,8 @@ bool CDirStatApp::InitInstance()
     const CWinDirStatCommandLineInfo cmdInfo;
     if (cmdInfo.HasMalformedCommandLine()) ExitProcess(1);
 
-    const bool hideApp = !m_saveToPath.empty() || !m_saveDupesToPath.empty() || !m_savePermsToPath.empty();
+    const bool hideApp = !m_saveToPath.empty() || !m_saveDupesToPath.empty() ||
+        !m_savePermsToPath.empty() || !m_ipcPipePath.empty();
     const bool autoElevate = IsElevationAvailable() && COptions::AutoElevate && !COptions::ShowElevationPrompt;
 
     // Elevate non-interactive operations before rejecting protected paths or applying changes.

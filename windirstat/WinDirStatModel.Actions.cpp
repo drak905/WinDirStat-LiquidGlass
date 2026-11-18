@@ -6,6 +6,7 @@
 
 #include "pch.h"
 #include "CsvLoader.h"
+#include "IpcStreamer.h"
 #include "FileTreeView.h"
 #include "FileTopControl.h"
 #include "FileSearchControl.h"
@@ -18,12 +19,111 @@
 #include "SearchDlg.h"
 #include "ProgressDlg.h"
 #include "Filtering.h"
+#include <charconv>
 
 static std::optional<std::wstring> ChooseReportPath(const CDialog::FilePickerMode mode)
 {
     return CDialog::PickFile(mode,
         std::format(L"{} (*.csv;*.json)|*.csv;*.json|{} (*.*)|*.*||",
         Localization::Lookup(IDS_FILE_FILTER), Localization::Lookup(IDS_ALL_FILES)));
+}
+
+static std::unordered_map<const CItem*, std::uint64_t> CollectXxHashLookup()
+{
+    std::unordered_map<const CItem*, std::uint64_t> hashes;
+    if (!COptions::ScanForDuplicates || COptions::FileHashAlgorithm.Obj() != HASH_XXHASH)
+    {
+        return hashes;
+    }
+
+    const auto* dupeCtrl = CFileDupeControl::Get();
+    const auto* dupeRoot = dupeCtrl != nullptr ? dupeCtrl->GetRootItem() : nullptr;
+    if (dupeRoot == nullptr) return hashes;
+
+    for (const auto& dupeGroup : dupeRoot->GetChildren())
+    {
+        const std::string hex = wds::ipc::WideToUtf8(dupeGroup->GetHash());
+        if (hex.size() != 16) continue;
+        std::uint64_t parsed = 0;
+        const auto [ptr, ec] = std::from_chars(hex.data(), hex.data() + hex.size(), parsed, 16);
+        if (ec != std::errc{} || ptr != hex.data() + hex.size()) continue;
+
+        for (const auto& dupeFile : dupeGroup->GetChildren())
+        {
+            if (const auto* linked = dupeFile->GetLinkedItem(); linked != nullptr)
+            {
+                hashes.emplace(linked, parsed);
+            }
+        }
+    }
+    return hashes;
+}
+
+static bool StreamResultsToIpcPipe(const std::wstring& pipePath, CItem* rootItem)
+{
+    if (rootItem == nullptr) return false;
+
+    auto writer = std::make_shared<wds::ipc::IpcNamedPipeWriter>(pipePath);
+    if (!writer->IsOpen()) return false;
+
+    const bool includeOwner = COptions::IsColumnVisible(COptions::FileTreeColumnVisibility.Obj(), COL_OWNER);
+    const auto xxhashLookup = CollectXxHashLookup();
+
+    wds::ipc::IpcStreamer streamer(writer, wds::ipc::IpcStreamerOptions{
+        .format = wds::ipc::IpcWireFormat::Ndjson,
+        .batch_size = 256,
+        .flush_interval_ms = 16,
+        .scan_root = wds::ipc::WideToUtf8(rootItem->IsTypeOrFlag(IT_MYCOMPUTER) ? rootItem->GetName() : rootItem->GetPath()),
+    });
+
+    struct WalkEntry
+    {
+        const CItem* item;
+        std::optional<std::uint64_t> parentId;
+    };
+
+    std::uint64_t nextId = 1;
+    std::vector<WalkEntry> stack;
+    stack.push_back({ rootItem, std::nullopt });
+
+    while (!stack.empty())
+    {
+        const auto [item, parentId] = stack.back();
+        stack.pop_back();
+
+        if (item == nullptr || item->IsTypeOrFlag(IT_HLINKS)) continue;
+
+        const std::uint64_t nodeId = nextId++;
+        const bool isMyComputer = item->IsTypeOrFlag(IT_MYCOMPUTER);
+        const auto hashIt = xxhashLookup.find(item);
+
+        wds::ipc::IpcNodeRecord record{
+            .id = nodeId,
+            .parent_id = parentId,
+            .name = wds::ipc::WideToUtf8(item->GetNameView()),
+            .full_path = wds::ipc::WideToUtf8(isMyComputer ? item->GetName() : item->GetPath()),
+            .is_dir = !item->IsLeaf(),
+            .logical_size = item->GetSizeLogical(),
+            .physical_size = item->HasSizePhysical() ? item->GetSizePhysicalRaw() : 0ULL,
+            .modified_utc = wds::ipc::FileTimeToIso8601Utc(std::bit_cast<std::uint64_t>(item->GetLastChange())),
+            .owner = includeOwner ? wds::ipc::WideToUtf8(item->GetOwner(true)) : std::string{},
+            .xxhash64 = (hashIt != xxhashLookup.end()) ? std::optional<std::uint64_t>(hashIt->second) : std::nullopt,
+            .extension = item->IsTypeOrFlag(IT_FILE) ? wds::ipc::WideToUtf8(item->GetExtension()) : std::string{},
+        };
+
+        if (!streamer.PushNode(std::move(record))) return false;
+
+        if (!item->IsLeaf())
+        {
+            const auto& children = item->GetChildren();
+            for (auto it = children.rbegin(); it != children.rend(); ++it)
+            {
+                stack.push_back({ *it, nodeId });
+            }
+        }
+    }
+
+    return streamer.Finish(rootItem->IsTypeOrFlag(ITF_SCANERROR) ? "scan completed with errors" : "");
 }
 void CWinDirStatModel::OnUpdateCentralHandler(CCmdUI* pCmdUI)
 {
@@ -1534,6 +1634,23 @@ void CWinDirStatModel::StartScanningEngine(std::vector<CItem*> items)
             const auto rows = CFilePermsControl::ScanTree(GetRootItem());
             const std::vector<const CItemPerm*> ptrs(rows.begin(), rows.end());
             ExitProcess(SavePermissions(permsSavePath, ptrs) && !GetRootItem()->IsTypeOrFlag(ITF_SCANERROR) ? 0 : 1);
+        }
+
+        // Handle quiet IPC streaming mode if pipe path is set
+        if (const auto ipcPipePath = CDirStatApp::Get()->GetIpcPipePath(); !ipcPipePath.empty())
+        {
+            const auto* model = Get();
+            if (!model->HasRootItem()) ExitProcess(1);
+            if (COptions::ScanForDuplicates)
+            {
+                CMainFrame::Get()->InvokeInMessageThread([]
+                {
+                    if (auto* dupe = CFileDupeControl::Get(); dupe != nullptr) dupe->SortItems();
+                });
+            }
+
+            ExitProcess(StreamResultsToIpcPipe(ipcPipePath, model->GetRootItem()) &&
+                !model->GetRootItem()->IsTypeOrFlag(ITF_SCANERROR) ? 0 : 1);
         }
 
         CMainFrame::Get()->InvokeInMessageThread([]

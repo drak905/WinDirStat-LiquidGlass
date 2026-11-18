@@ -663,7 +663,8 @@ bool CMainFrame::PreCreateWindow(CREATESTRUCT& cs)
     // Prevent flashing of the main window when launching in non-interactive mode
     if (!CDirStatApp::Get()->GetSaveToPath().empty() ||
         !CDirStatApp::Get()->GetSaveDupesToPath().empty() ||
-        !CDirStatApp::Get()->GetSavePermsToPath().empty())
+        !CDirStatApp::Get()->GetSavePermsToPath().empty() ||
+        !CDirStatApp::Get()->GetIpcPipePath().empty())
     {
         CDirStatApp::Get()->m_nCmdShow = SW_HIDE;
         cs.style &= ~WS_VISIBLE;

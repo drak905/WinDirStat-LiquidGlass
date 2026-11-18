@@ -212,6 +212,7 @@ POWERSHELL.EXE -NoLogo -ExecutionPolicy Unrestricted -NoProfile -File "$(Project
     <ClInclude Include="Constants.h" />
     <ClInclude Include="BlockingQueue.h" />
     <ClInclude Include="CsvLoader.h" />
+    <ClInclude Include="IpcStreamer.h" />
     <ClInclude Include="WinDirStatModel.h" />
     <ClInclude Include="FinderBasic.h" />
     <ClInclude Include="Item.h" />
@@ -269,6 +270,9 @@ POWERSHELL.EXE -NoLogo -ExecutionPolicy Unrestricted -NoProfile -File "$(Project
     <ClCompile Include="Controls\Sunburst.cpp" />
     <ClCompile Include="Controls\XYSlider.cpp" />
     <ClCompile Include="CsvLoader.cpp" />
+    <ClCompile Include="IpcStreamer.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="DarkMode.cpp" />
     <ClCompile Include="UiAppearance.cpp" />
     <ClCompile Include="UiControls.cpp" />
