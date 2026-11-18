@@ -26,7 +26,7 @@ describe('Tauri v2 Liquid Glass Configuration', () => {
     );
   });
 
-  it('grants core and window permissions in capabilities/default.json without Rust source overrides', () => {
+  it('grants core and window permissions in capabilities/default.json alongside integrated Rust backend', () => {
     const capPath = path.join(repoRoot, 'src-tauri', 'capabilities', 'default.json');
     expect(fs.existsSync(capPath)).toBe(true);
 
@@ -41,7 +41,7 @@ describe('Tauri v2 Liquid Glass Configuration', () => {
       ])
     );
 
-    expect(fs.existsSync(path.join(repoRoot, 'src-tauri', 'Cargo.toml'))).toBe(false);
-    expect(fs.existsSync(path.join(repoRoot, 'src-tauri', 'src'))).toBe(false);
+    expect(fs.existsSync(path.join(repoRoot, 'src-tauri', 'Cargo.toml'))).toBe(true);
+    expect(fs.existsSync(path.join(repoRoot, 'src-tauri', 'src'))).toBe(true);
   });
 });

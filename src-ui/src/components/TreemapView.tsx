@@ -49,15 +49,18 @@ export const TreemapView: React.FC<TreemapViewProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const glRendererRef = useRef<WebGL2CushionRenderer | null>(null);
   const bufferRef = useRef<Uint8ClampedArray | null>(null);
   const cachedImageDataRef = useRef<ImageData | null>(null);
+  const cursorRef = useRef({ x: -1000, y: -1000 });
+  const hoveredRectRef = useRef<TreemapRect | null>(null);
+  const rafCompositeRef = useRef<number | null>(null);
 
   const [canvasSize, setCanvasSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [breadcrumbs, setBreadcrumbs] = useState<StorageNode[]>([root]);
   const [hoveredRect, setHoveredRect] = useState<TreemapRect | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [cursorPos, setCursorPos] = useState({ x: -1000, y: -1000 });
   const [frameTimeMs, setFrameTimeMs] = useState<number>(0);
 
   // Reset breadcrumbs when scanned root changes
@@ -144,29 +147,44 @@ export const TreemapView: React.FC<TreemapViewProps> = ({
     if (glRendererRef.current) {
       glRendererRef.current.uploadTexture(bufferRef.current, width, height);
     } else if (typeof ImageData !== 'undefined') {
-      cachedImageDataRef.current = new ImageData(
+      const imgData = new ImageData(
         new Uint8ClampedArray(bufferRef.current),
         width,
         height
       );
+      cachedImageDataRef.current = imgData;
+      if (typeof document !== 'undefined') {
+        const offscreen = offscreenCanvasRef.current ?? document.createElement('canvas');
+        offscreen.width = width;
+        offscreen.height = height;
+        offscreenCanvasRef.current = offscreen;
+        try {
+          offscreen.getContext('2d')?.putImageData(imgData, 0, 0);
+        } catch {
+          // jsdom / environments without 2D canvas context fall back cleanly
+        }
+      }
     }
 
     setFrameTimeMs(Number((layout.elapsedMs + shadeMs).toFixed(2)));
   }, [layout, canvasSize, selectedNodeId]);
 
-  // Stage 2: Composite cursor-linked specular glass highlight at 60-120fps without re-shading cushions
-  useEffect(() => {
+  // Stage 2: Composite cursor-linked specular glass highlight directly via GPU/canvas without React re-renders
+  const compositeOverlay = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { width, height } = canvasSize;
     if (width <= 0 || height <= 0) return;
 
+    const cursor = cursorRef.current;
+    const activeHover = hoveredRectRef.current;
+
     const glRenderer = glRendererRef.current;
     if (glRenderer) {
-      const hr: [number, number, number, number] | null = hoveredRect
-        ? [hoveredRect.x, hoveredRect.y, hoveredRect.w, hoveredRect.h]
+      const hr: [number, number, number, number] | null = activeHover
+        ? [activeHover.x, activeHover.y, activeHover.w, activeHover.h]
         : null;
-      glRenderer.draw(width, height, cursorPos.x, cursorPos.y, hr);
+      glRenderer.draw(width, height, cursor.x, cursor.y, hr);
       return;
     }
 
@@ -178,38 +196,46 @@ export const TreemapView: React.FC<TreemapViewProps> = ({
     }
     if (!ctx) return;
 
-    if (cachedImageDataRef.current) {
+    if (offscreenCanvasRef.current) {
+      ctx.drawImage(offscreenCanvasRef.current, 0, 0);
+    } else if (cachedImageDataRef.current) {
       ctx.putImageData(cachedImageDataRef.current, 0, 0);
     }
 
-    if (cursorPos.x >= 0 && cursorPos.y >= 0) {
-      const grad = ctx.createRadialGradient(
-        cursorPos.x,
-        cursorPos.y,
-        4,
-        cursorPos.x,
-        cursorPos.y,
-        130
-      );
+    if (cursor.x >= 0 && cursor.y >= 0) {
+      const grad = ctx.createRadialGradient(cursor.x, cursor.y, 4, cursor.x, cursor.y, 130);
       grad.addColorStop(0, 'rgba(255, 255, 255, 0.22)');
       grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, width, height);
     }
 
-    if (hoveredRect) {
+    if (activeHover) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.16)';
-      ctx.fillRect(hoveredRect.x, hoveredRect.y, hoveredRect.w, hoveredRect.h);
+      ctx.fillRect(activeHover.x, activeHover.y, activeHover.w, activeHover.h);
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
       ctx.lineWidth = 1.5;
       ctx.strokeRect(
-        hoveredRect.x + 0.75,
-        hoveredRect.y + 0.75,
-        Math.max(1, hoveredRect.w - 1.5),
-        Math.max(1, hoveredRect.h - 1.5)
+        activeHover.x + 0.75,
+        activeHover.y + 0.75,
+        Math.max(1, activeHover.w - 1.5),
+        Math.max(1, activeHover.h - 1.5)
       );
     }
-  }, [layout, canvasSize, hoveredRect, cursorPos]);
+  }, [canvasSize]);
+
+  useEffect(() => {
+    hoveredRectRef.current = hoveredRect;
+    compositeOverlay();
+  }, [layout, canvasSize, hoveredRect, selectedNodeId, compositeOverlay]);
+
+  useEffect(() => {
+    return () => {
+      if (rafCompositeRef.current !== null && typeof cancelAnimationFrame !== 'undefined') {
+        cancelAnimationFrame(rafCompositeRef.current);
+      }
+    };
+  }, []);
 
   const toCanvasCoords = useCallback(
     (clientX: number, clientY: number) => {
@@ -242,9 +268,18 @@ export const TreemapView: React.FC<TreemapViewProps> = ({
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const pt = toCanvasCoords(e.clientX, e.clientY);
-    setCursorPos(pt);
+    cursorRef.current = pt;
     const hit = hitTestTreemap(layout.rects, pt.x, pt.y);
-    setHoveredRect(hit);
+    hoveredRectRef.current = hit;
+
+    if ((hit?.node.id ?? null) !== (hoveredRect?.node.id ?? null)) {
+      setHoveredRect(hit);
+    } else if (rafCompositeRef.current === null && typeof requestAnimationFrame !== 'undefined') {
+      rafCompositeRef.current = requestAnimationFrame(() => {
+        rafCompositeRef.current = null;
+        compositeOverlay();
+      });
+    }
   };
 
   const handleCanvasDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {

@@ -108,7 +108,7 @@ jobs:
           if (Test-Path 'tests/IpcStreamerTests.cpp') {
             $vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
             $testExe = Join-Path $env:RUNNER_TEMP 'wds_ipc_tests.exe'
-            $cmdLine = "`"$vsDevCmd`" -arch=amd64 -no_logo && cl.exe /nologo /std:c++23 /EHsc /Iwindirstat tests\IpcStreamerTests.cpp /Fe:`"$testExe`" && `"$testExe`""
+            $cmdLine = "`"$vsDevCmd`" -arch=amd64 -no_logo && cl.exe /nologo /std:c++latest /EHsc /Iwindirstat windirstat\IpcStreamer.cpp tests\IpcStreamerTests.cpp /Fe:`"$testExe`" && `"$testExe`""
             cmd.exe /c $cmdLine
             if ($LASTEXITCODE -ne 0) { throw "C++23 IpcStreamerTests failed with exit code $LASTEXITCODE" }
           }

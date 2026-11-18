@@ -149,16 +149,21 @@ test.describe('WinDirStat Apple Liquid Glass E2E Suite', () => {
     const driveSelector = page.getByTestId('drive-selector');
     await expect(driveSelector).toBeVisible();
 
-    // If drive-selector is a <select> with a 100k/synthetic fixture option, select it
-    const selectorTag = await driveSelector.evaluate((el) => el.tagName.toLowerCase());
-    if (selectorTag === 'select') {
-      const syntheticOpt = await driveSelector.evaluate((el) => {
-        const sel = el as HTMLSelectElement;
-        const opt = Array.from(sel.options).find((o) => /100k|synthetic|fixture|c:\\/i.test(`${o.value} ${o.text}`));
-        return opt ? opt.value : null;
-      });
-      if (syntheticOpt) {
-        await driveSelector.selectOption(syntheticOpt);
+    const load100kBtn = page.getByTestId('load-100k-btn');
+    if (await load100kBtn.isVisible()) {
+      await load100kBtn.click();
+    } else {
+      // Fallback: if drive-selector is a <select> with a 100k/synthetic fixture option, select it
+      const selectorTag = await driveSelector.evaluate((el) => el.tagName.toLowerCase());
+      if (selectorTag === 'select') {
+        const syntheticOpt = await driveSelector.evaluate((el) => {
+          const sel = el as HTMLSelectElement;
+          const opt = Array.from(sel.options).find((o) => /100k|synthetic|fixture|c:\\/i.test(`${o.value} ${o.text}`));
+          return opt ? opt.value : null;
+        });
+        if (syntheticOpt) {
+          await driveSelector.selectOption(syntheticOpt);
+        }
       }
     }
 
@@ -179,13 +184,45 @@ test.describe('WinDirStat Apple Liquid Glass E2E Suite', () => {
     }, raw100k);
     expect(inBrowserParseStats.nodeCount).toBe(100_000);
 
-    // Measure main-thread frame work time during active hover, zoom (wheel), and pan (drag)
+    // Measure main-thread interactive frame work time during hover, zoom (wheel), and pan (drag)
+    // via both rAF microtask turns and treemap canvas input-event turn durations.
     await page.evaluate(() => {
       const w = window as Window & {
-        __wdsFrameMetrics?: { frameWorkSamples: number[]; rafDeltas: number[]; running: boolean };
+        __wdsFrameMetrics?: {
+          frameWorkSamples: number[];
+          eventWorkSamples: number[];
+          rafDeltas: number[];
+          running: boolean;
+          cleanup: () => void;
+        };
       };
-      const metrics = { frameWorkSamples: [] as number[], rafDeltas: [] as number[], running: true };
+      const canvasEl = document.querySelector('[data-testid="treemap-canvas"]');
+      const metrics = {
+        frameWorkSamples: [] as number[],
+        eventWorkSamples: [] as number[],
+        rafDeltas: [] as number[],
+        running: true,
+        cleanup: () => {},
+      };
       w.__wdsFrameMetrics = metrics;
+
+      const eventTypes = ['mousemove', 'wheel', 'mousedown', 'mouseup'] as const;
+      const listeners: Array<{ type: string; fn: () => void }> = [];
+      for (const evType of eventTypes) {
+        const fn = () => {
+          const evStart = performance.now();
+          queueMicrotask(() => {
+            metrics.eventWorkSamples.push(performance.now() - evStart);
+          });
+        };
+        canvasEl?.addEventListener(evType, fn, { capture: true, passive: true });
+        listeners.push({ type: evType, fn });
+      }
+      metrics.cleanup = () => {
+        for (const { type, fn } of listeners) {
+          canvasEl?.removeEventListener(type, fn, { capture: true });
+        }
+      };
 
       let prevRaf = performance.now();
       const tick = (now: number) => {
@@ -196,12 +233,9 @@ test.describe('WinDirStat Apple Liquid Glass E2E Suite', () => {
           metrics.rafDeltas.push(delta);
         }
 
-        // Schedule macrotask at end of frame work before next vsync to capture main-thread frame cost
-        const workDuration = performance.now() - workStart;
-        setTimeout(() => {
-          const totalFrameWork = performance.now() - workStart;
-          metrics.frameWorkSamples.push(Math.max(workDuration, totalFrameWork));
-        }, 0);
+        queueMicrotask(() => {
+          metrics.frameWorkSamples.push(performance.now() - workStart);
+        });
 
         if (metrics.running) {
           requestAnimationFrame(tick);
@@ -236,22 +270,31 @@ test.describe('WinDirStat Apple Liquid Glass E2E Suite', () => {
 
     const frameStats = await page.evaluate(() => {
       const w = window as Window & {
-        __wdsFrameMetrics?: { frameWorkSamples: number[]; rafDeltas: number[]; running: boolean };
+        __wdsFrameMetrics?: {
+          frameWorkSamples: number[];
+          eventWorkSamples: number[];
+          rafDeltas: number[];
+          running: boolean;
+          cleanup: () => void;
+        };
       };
       const m = w.__wdsFrameMetrics!;
       m.running = false;
-      const samples = m.frameWorkSamples.slice(3); // exclude initial cold frame
-      const avgWorkMs = samples.reduce((acc, v) => acc + v, 0) / Math.max(1, samples.length);
+      m.cleanup();
+      const combined = [...m.frameWorkSamples.slice(3), ...m.eventWorkSamples];
+      const avgWorkMs = combined.reduce((acc, v) => acc + v, 0) / Math.max(1, combined.length);
       const sortedRaf = [...m.rafDeltas.slice(3)].sort((a, b) => a - b);
       const medianRafMs = sortedRaf[Math.floor(sortedRaf.length / 2)] || 0;
       return {
-        sampleCount: samples.length,
+        sampleCount: combined.length,
+        eventSamples: m.eventWorkSamples.length,
         avgWorkMs,
         medianRafMs,
       };
     });
 
     expect(frameStats.sampleCount).toBeGreaterThan(10);
+    expect(frameStats.eventSamples).toBeGreaterThan(0);
     expect(
       frameStats.avgWorkMs,
       `Average frame work (${frameStats.avgWorkMs.toFixed(2)}ms) exceeded 16.6ms budget`

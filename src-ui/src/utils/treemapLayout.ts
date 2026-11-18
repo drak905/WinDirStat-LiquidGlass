@@ -413,7 +413,7 @@ export function renderTreemapToBuffer(
     const bx = rect.bx;
     const ay = rect.ay;
     const by = rect.by;
-    const dnx = -2 * ax;
+    const dnx2 = -4 * ax;
     const nxStart = -(2 * ax * (px0 + 0.5) + bx);
 
     for (let y = py0; y < py1; y += 1) {
@@ -424,7 +424,7 @@ export function renderTreemapToBuffer(
       let nx = nxStart;
       let pIdx = y * width + px0;
 
-      for (let x = px0; x < px1; x += 1) {
+      for (let x = px0; x < px1; x += 2) {
         const dot = nx * lx + nyLyLz;
         const cosa = dot > 0 ? dot / Math.sqrt(nx * nx + ny2Plus1) : 0;
         const intensity = ambient + diffuse * cosa;
@@ -436,8 +436,13 @@ export function renderTreemapToBuffer(
         if (g > 255) g = 255;
         if (b > 255) b = 255;
 
-        i32[pIdx++] = 0xff000000 | (b << 16) | (g << 8) | r;
-        nx += dnx;
+        const abgr = 0xff000000 | (b << 16) | (g << 8) | r;
+        i32[pIdx] = abgr;
+        if (x + 1 < px1) {
+          i32[pIdx + 1] = abgr;
+        }
+        pIdx += 2;
+        nx += dnx2;
       }
     }
   }

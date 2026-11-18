@@ -44,7 +44,12 @@ $FixturesDir = Join-Path $RepoRoot 'tests\fixtures'
 $IpcTestSource = Join-Path $RepoRoot 'tests\IpcStreamerTests.cpp'
 $SolutionPath = Join-Path $RepoRoot 'windirstat.sln'
 
-# Ensure user-scoped toolchains (Cargo, WinGet Links, npm global shims) are visible on PATH.
+# Ensure Machine + User registry PATH (e.g. newly installed WinLibs/Rust) and user-scoped toolchains are visible.
+$machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+$userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+$mergedPaths = @($machinePath, $userPath, $env:PATH) -join ';' -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+$env:PATH = $mergedPaths -join ';'
+
 $extraPaths = @(
     (Join-Path $env:USERPROFILE '.cargo\bin'),
     (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'),
@@ -161,7 +166,8 @@ function Invoke-GppIpcTests {
     $tempExe = Join-Path $env:TEMP ("wds_ipc_streamer_tests_{0}.exe" -f [System.Diagnostics.Process]::GetCurrentProcess().Id)
     try {
         Write-Host "[Tier 1A] Compiling $TestCppPath with $($gpp.Source) -std=c++23..." -ForegroundColor Yellow
-        & $gpp.Source -std=c++23 -Wall -Wextra "-I$(Join-Path $RepoRoot 'windirstat')" $TestCppPath -o $tempExe
+        $streamerCpp = Join-Path $RepoRoot 'windirstat\IpcStreamer.cpp'
+        & $gpp.Source -std=c++23 -Wall -Wextra "-I$(Join-Path $RepoRoot 'windirstat')" $streamerCpp $TestCppPath -o $tempExe
         if ($LASTEXITCODE -ne 0) {
             throw "g++ -std=c++23 compilation failed with exit code $LASTEXITCODE"
         }
@@ -250,7 +256,8 @@ try {
                     if (Test-Path -LiteralPath $vsDevCmd) {
                         $tempMsvcExe = Join-Path $env:TEMP ("wds_ipc_msvc_{0}.exe" -f [System.Diagnostics.Process]::GetCurrentProcess().Id)
                         try {
-                            $cmdLine = "`"$vsDevCmd`" -arch=amd64 -no_logo && cl.exe /nologo /std:c++23 /EHsc /I`"$RepoRoot\windirstat`" `"$IpcTestSource`" /Fe:`"$tempMsvcExe`" && `"$tempMsvcExe`""
+                            $streamerCpp = Join-Path $RepoRoot 'windirstat\IpcStreamer.cpp'
+                            $cmdLine = "`"$vsDevCmd`" -arch=amd64 -no_logo && cl.exe /nologo /std:c++latest /EHsc /I`"$RepoRoot\windirstat`" `"$streamerCpp`" `"$IpcTestSource`" /Fe:`"$tempMsvcExe`" && `"$tempMsvcExe`""
                             & cmd.exe /c $cmdLine
                             if ($LASTEXITCODE -ne 0) {
                                 throw "MSVC C++23 IpcStreamerTests failed with exit code $LASTEXITCODE"
