@@ -1,0 +1,12 @@
+{
+  "provider": "antigravity",
+  "target_path": "C:\\Users\\Developer\\AppData\\Local\\Temp",
+  "verdict": "UNKNOWN_VERDICT",
+  "risk_score": 250,
+  "reclaimable_bytes": -100,
+  "cross_checked_sources": [
+    { "url": "not-a-valid-url" },
+    { "url": "ftp://unsupported.example.invalid/file" },
+    { "url": "https://example.org/only-one-valid-http" }
+  ]
+}

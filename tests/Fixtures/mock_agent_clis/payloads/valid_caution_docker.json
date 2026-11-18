@@ -1,0 +1,33 @@
+{
+  "provider": "claude",
+  "model": "claude-sonnet-4-mock",
+  "target_path": "C:\\ProgramData\\Docker\\windowsfilter",
+  "verdict": "SAFE_WITH_APP_CLOSED",
+  "risk_score": 48,
+  "reclaimable_bytes": 1073741824,
+  "usage_value_assessment": "Docker windowsfilter layers may back active containers or base images. Verify active containers via `docker ps -a` or place unused layers into 7-Day Quarantine before permanent deletion.",
+  "cross_checked_sources": [
+    {
+      "title": "Docker Disk Space & Prune Reference - Docker Docs",
+      "url": "https://docs.docker.com/config/pruning/",
+      "domain": "docs.docker.com",
+      "authority": "official-docs",
+      "summary": "Docker manages layered images under windowsfilter; use docker system prune for safe cleanup."
+    },
+    {
+      "title": "Manage WSL 2 Disk Space & VHDX Compaction - Microsoft Learn",
+      "url": "https://learn.microsoft.com/en-us/windows/wsl/disk-space",
+      "domain": "learn.microsoft.com",
+      "authority": "official-docs",
+      "summary": "Virtual disk layers should be compacted or backed up before manual removal."
+    },
+    {
+      "title": "Windows Containers Storage Overview - Microsoft Learn",
+      "url": "https://learn.microsoft.com/en-us/virtualization/windowscontainers/manage-containers/container-storage",
+      "domain": "learn.microsoft.com",
+      "authority": "official-docs",
+      "summary": "Deleting raw container filter directories outside Docker daemon can orphan image metadata."
+    }
+  ],
+  "recommended_action": "ARCHIVE_OR_QUARANTINE_WITH_REVIEW"
+}

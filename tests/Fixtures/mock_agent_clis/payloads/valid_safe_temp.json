@@ -1,0 +1,40 @@
+{
+  "provider": "antigravity",
+  "model": "gemini-2.5-pro-mock",
+  "target_path": "C:\\Users\\Developer\\AppData\\Local\\Temp",
+  "verdict": "SAFE_TO_DELETE",
+  "risk_score": 8,
+  "reclaimable_bytes": 536870912,
+  "usage_value_assessment": "Ephemeral scratch dumps, Vite cache binaries, and expired logs inside Local\\Temp have minimal operational value and can be safely quarantined for 7 days with full rollback.",
+  "cross_checked_sources": [
+    {
+      "title": "Disk Cleanup in Windows - Microsoft Support",
+      "url": "https://support.microsoft.com/en-us/windows/disk-cleanup-in-windows-8a96ff42-5751-39ad-23d6-434b4d5b9a68",
+      "domain": "support.microsoft.com",
+      "authority": "official-vendor",
+      "summary": "Temporary files in Windows Local\\Temp are safe to remove when applications are idle."
+    },
+    {
+      "title": "Temporary Files & Storage Sense Architecture - Microsoft Learn",
+      "url": "https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-storage",
+      "domain": "learn.microsoft.com",
+      "authority": "official-docs",
+      "summary": "Storage Sense automatically targets temporary user files for reclamation."
+    },
+    {
+      "title": "npm cache command documentation - npm Docs",
+      "url": "https://docs.npmjs.com/cli/v10/commands/npm-cache",
+      "domain": "docs.npmjs.com",
+      "authority": "official-docs",
+      "summary": "Package caches are fully reproducible from registries on next install."
+    },
+    {
+      "title": "Cargo Build Cache & Target Directory - The Cargo Book",
+      "url": "https://doc.rust-lang.org/cargo/guide/build-cache.html",
+      "domain": "doc.rust-lang.org",
+      "authority": "official-docs",
+      "summary": "Incremental compiler caches can be safely deleted to reclaim disk space."
+    }
+  ],
+  "recommended_action": "QUARANTINE_7_DAYS"
+}
