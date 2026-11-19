@@ -215,4 +215,43 @@ describe('Agent CLI Storage Advisor Chat', () => {
     expect(screen.getByTestId('agent-unavailable-banner')).toHaveTextContent('npm install -g @anthropic-ai/claude-code');
     expect(screen.getByTestId('agent-error-card')).toHaveTextContent('Claude Code CLI was not found on PATH.');
   });
+
+  it('shows OpenCode model selector when opencode is active and forwards selected model to onSendPrompt', async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn(async () => ({}));
+
+    render(
+      <AgentAdvisorPanel
+        providers={[
+          { provider: 'opencode', displayName: 'OpenCode CLI', available: true, command: 'opencode', latencyMs: 44 },
+        ]}
+        selectedProvider="opencode"
+        onProviderChange={() => {}}
+        opencodeModels={['opencode/big-pickle', 'opencode/glm-5.3-flash-free']}
+        responses={[]}
+        isStreaming={false}
+        onSendPrompt={onSend}
+        onQuarantineRecommended={async () => {}}
+      />
+    );
+
+    const modelSelect = screen.getByTestId('opencode-model-select') as HTMLSelectElement;
+    expect(Array.from(modelSelect.options).map((o) => o.value)).toEqual([
+      '',
+      'opencode/big-pickle',
+      'opencode/glm-5.3-flash-free',
+    ]);
+
+    await user.selectOptions(modelSelect, 'opencode/big-pickle');
+    await user.type(screen.getByTestId('agent-chat-input'), 'Say hello from OpenCode');
+    await user.click(screen.getByTestId('agent-send-btn'));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend).toHaveBeenCalledWith({
+      provider: 'opencode',
+      prompt: 'Say hello from OpenCode',
+      customCommand: undefined,
+      model: 'opencode/big-pickle',
+    });
+  });
 });

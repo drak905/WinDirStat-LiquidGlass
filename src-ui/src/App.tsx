@@ -38,6 +38,7 @@ export function App() {
   const [duplicates, setDuplicates] = useState<DuplicateGroup[]>(() => createDemoDuplicates());
   const [vaultItems, setVaultItems] = useState<VaultItem[]>(() => createInitialVaultItems());
   const [providers, setProviders] = useState<AgentProviderStatus[]>([]);
+  const [opencodeModels, setOpencodeModels] = useState<string[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<AgentProvider>('antigravity');
   const [advisorResponses, setAdvisorResponses] = useState<AgentAdvisorResponse[]>([]);
   const [isStreamingAdvice, setIsStreamingAdvice] = useState(false);
@@ -89,11 +90,28 @@ export function App() {
       setProviders(detectedClis);
       setVaultItems(vaultList);
       setDuplicates(dupList);
+      if (detectedClis.some((p) => p.provider === 'opencode' && p.available) && bridge.listOpenCodeModels) {
+        const models = await bridge.listOpenCodeModels();
+        if (active) setOpencodeModels(models);
+      }
     })();
     return () => {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (selectedProvider !== 'opencode' || opencodeModels.length > 0) return;
+    const bridge = getBridge();
+    if (!bridge.listOpenCodeModels) return;
+    let active = true;
+    void bridge.listOpenCodeModels().then((models) => {
+      if (active && models.length > 0) setOpencodeModels(models);
+    });
+    return () => {
+      active = false;
+    };
+  }, [selectedProvider, opencodeModels.length]);
 
   const handleScan = useCallback(
     async (overrideTarget?: string) => {
@@ -126,6 +144,7 @@ export function App() {
       targetName?: string;
       targetSizeBytes?: number;
       customCommand?: string;
+      model?: string;
     }) => {
       setIsStreamingAdvice(true);
       try {
@@ -283,12 +302,20 @@ export function App() {
               providers={providers}
               selectedProvider={selectedProvider}
               onProviderChange={setSelectedProvider}
+              opencodeModels={opencodeModels}
               responses={advisorResponses}
               isStreaming={isStreamingAdvice}
               onSendPrompt={handleAskAgent}
               onRefreshProviders={async () => {
-                const detected = await getBridge().detectAgentClis();
+                const bridge = getBridge();
+                const detected = await bridge.detectAgentClis();
                 setProviders(detected);
+                if (
+                  detected.some((p) => p.provider === 'opencode' && p.available) &&
+                  bridge.listOpenCodeModels
+                ) {
+                  setOpencodeModels(await bridge.listOpenCodeModels());
+                }
               }}
               onQuarantineRecommended={(resp) =>
                 handleQuarantine({

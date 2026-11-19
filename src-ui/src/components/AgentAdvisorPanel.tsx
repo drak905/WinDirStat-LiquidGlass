@@ -20,10 +20,18 @@ import type {
 import { AGENT_PROVIDERS } from '../services/tauriBridge';
 import { formatBytes } from '../utils/formatters';
 
+const FALLBACK_OPENCODE_MODELS = [
+  'opencode/big-pickle',
+  'opencode/glm-5.3-flash-free',
+  'opencode/deepseek-v4.1-flash-free',
+  'opencode/beam-free',
+];
+
 interface AgentAdvisorPanelProps {
   providers: AgentProviderStatus[];
   selectedProvider: AgentProvider;
   onProviderChange: (provider: AgentProvider) => void;
+  opencodeModels?: string[];
   responses: AgentAdvisorResponse[];
   isStreaming: boolean;
   onSendPrompt: (params: {
@@ -33,6 +41,7 @@ interface AgentAdvisorPanelProps {
     targetName?: string;
     targetSizeBytes?: number;
     customCommand?: string;
+    model?: string;
   }) => Promise<unknown>;
   onRefreshProviders?: () => Promise<void>;
   onQuarantineRecommended: (response: AgentAdvisorResponse) => Promise<void>;
@@ -61,6 +70,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
   providers,
   selectedProvider,
   onProviderChange,
+  opencodeModels,
   responses,
   isStreaming,
   onSendPrompt,
@@ -69,11 +79,17 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
 }) => {
   const [promptInput, setPromptInput] = useState('');
   const [customCmd, setCustomCmd] = useState('my-local-agent --json');
+  const [selectedOpenCodeModel, setSelectedOpenCodeModel] = useState('');
   const [quarantinedIds, setQuarantinedIds] = useState<Record<string, boolean>>({});
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
 
   const activeProviderStatus = providers.find((p) => p.provider === selectedProvider);
   const availableBuiltins = providers.filter((p) => p.available && p.provider !== 'custom');
+  const openCodeModelOptions =
+    opencodeModels && opencodeModels.length > 0 ? opencodeModels : FALLBACK_OPENCODE_MODELS;
+
+  const activeModelOverride =
+    selectedProvider === 'opencode' && selectedOpenCodeModel ? selectedOpenCodeModel : undefined;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -84,6 +100,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
       provider: selectedProvider,
       prompt: trimmed,
       customCommand: selectedProvider === 'custom' ? customCmd : undefined,
+      model: activeModelOverride,
     });
   };
 
@@ -187,6 +204,26 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
               ))}
             </select>
 
+            {selectedProvider === 'opencode' && (
+              <select
+                data-testid="opencode-model-select"
+                aria-label="OpenCode Model"
+                value={selectedOpenCodeModel}
+                onChange={(e) => setSelectedOpenCodeModel(e.target.value)}
+                title="Choose an OpenCode model or Auto fallback"
+                className="max-w-52 rounded-xl border border-white/25 bg-white/25 px-2.5 py-1.5 font-mono text-[11px] font-medium text-slate-900 outline-none focus:ring-2 focus:ring-sky-400/60 dark:bg-slate-900/75 dark:text-slate-100"
+              >
+                <option value="" className="bg-slate-900 text-slate-100">
+                  Auto (Config / Free Fallback)
+                </option>
+                {openCodeModelOptions.map((modelId) => (
+                  <option key={modelId} value={modelId} className="bg-slate-900 text-slate-100">
+                    {modelId}
+                  </option>
+                ))}
+              </select>
+            )}
+
             {selectedProvider === 'custom' && (
               <input
                 type="text"
@@ -266,7 +303,14 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
                   key={suggestion}
                   type="button"
                   disabled={isStreaming}
-                  onClick={() => void onSendPrompt({ provider: selectedProvider, prompt: suggestion })}
+                  onClick={() =>
+                    void onSendPrompt({
+                      provider: selectedProvider,
+                      prompt: suggestion,
+                      customCommand: selectedProvider === 'custom' ? customCmd : undefined,
+                      model: activeModelOverride,
+                    })
+                  }
                   className="rounded-xl border border-white/20 bg-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-800 hover:bg-white/25 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-200"
                 >
                   {suggestion}

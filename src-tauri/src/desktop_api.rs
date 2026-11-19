@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,10 +12,11 @@ use serde_json::{json, Value};
 use crate::agent_hub::context::{LockedHandleStatus, StorageContextPayload};
 use crate::agent_hub::prompt::build_cross_check_system_prompt;
 use crate::agent_hub::providers::{
-    discover_all_provider_statuses, AgentProvider, AgentProviderKind, CustomCliConfig,
+    build_opencode_isolated_config, discover_all_provider_statuses, AgentProvider,
+    AgentProviderKind, CustomCliConfig,
 };
 use crate::agent_hub::runner::{
-    AgentHubError, AgentHubRunner, DefaultCommandResolver, RunnerConfig,
+    AgentHubError, AgentHubRunner, CommandResolver, DefaultCommandResolver, RunnerConfig,
 };
 use crate::agent_hub::validator::{
     extract_assistant_text, extract_external_urls_from_text, parse_and_validate_advisor_response,
@@ -635,6 +636,159 @@ fn truncate_snippet(raw: &str, max_chars: usize) -> String {
     }
 }
 
+fn extract_logfmt_quoted_value(line: &str, key: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(key) {
+        let abs = search_from + rel;
+        let boundary_ok = abs == 0
+            || line.as_bytes()[abs - 1].is_ascii_whitespace();
+        if !boundary_ok {
+            search_from = abs + key.len();
+            continue;
+        }
+        let rest = &line[abs + key.len()..];
+        let Some(after_quote) = rest.strip_prefix('"') else {
+            let unquoted = rest.split_whitespace().next().unwrap_or("").trim();
+            if !unquoted.is_empty() {
+                return Some(unquoted.to_string());
+            }
+            search_from = abs + key.len();
+            continue;
+        };
+        let mut out = String::new();
+        let mut chars = after_quote.chars().peekable();
+        let mut escaped = false;
+        while let Some(ch) = chars.next() {
+            if escaped {
+                match ch {
+                    'n' | 'r' => break, // Stop before multi-line stack traces inside logfmt error strings.
+                    't' => out.push(' '),
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    other => out.push(other),
+                }
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                break;
+            }
+            out.push(ch);
+        }
+        let cleaned = out.trim();
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+        search_from = abs + key.len();
+    }
+    None
+}
+
+/// Extracts a concise human-readable error message from CLI stdout/stderr (e.g., OpenCode
+/// `--print-logs` `level=ERROR` lines and `{"type":"error",...}` NDJSON events), stripping
+/// redundant stack traces and HTTP header blobs.
+pub fn extract_cli_error_detail(stdout: &str, stderr: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains("level=ERROR")
+            || trimmed.contains("error.error=")
+            || trimmed.contains("ProviderModelNotFoundError")
+        {
+            if let Some(msg) = extract_logfmt_quoted_value(trimmed, "error.error=")
+                .or_else(|| extract_logfmt_quoted_value(trimmed, "error="))
+            {
+                let normalized = msg
+                    .strip_prefix("AI_APICallError:")
+                    .map(str::trim)
+                    .unwrap_or(&msg)
+                    .to_string();
+                if !normalized.is_empty() {
+                    candidates.push(normalized);
+                }
+            }
+        }
+    }
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("error") || obj.contains_key("error") {
+            let msg = obj
+                .get("error")
+                .and_then(|e| {
+                    e.get("data")
+                        .and_then(|d| d.get("message"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| e.get("message").and_then(|v| v.as_str()))
+                        .or_else(|| e.as_str())
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(m) = msg {
+                candidates.push(m.to_string());
+            }
+        }
+    }
+
+    if let Some(specific) = candidates
+        .iter()
+        .find(|c| !c.starts_with("Unexpected server error"))
+    {
+        return Some(specific.clone());
+    }
+    candidates.into_iter().next()
+}
+
+fn build_cli_error_hint(provider_str: &str, text_lower: &str) -> &'static str {
+    if provider_str == "opencode" {
+        if text_lower.contains("providermodelnotfounderror") || text_lower.contains("model not found")
+        {
+            return " Your default OpenCode model may be retired — pick another model in the OpenCode Model selector or update ~/.config/opencode/opencode.json.";
+        }
+        if text_lower.contains("free usage limit reached") {
+            return " OpenCode's free usage limit was hit — choose another model in the OpenCode Model selector or sign in (`opencode auth login`).";
+        }
+        if text_lower.contains("subscription is required") {
+            return " OpenCode Go models require an active Go subscription — choose an `opencode/*` free model (such as `opencode/big-pickle`) in the OpenCode Model selector.";
+        }
+        if text_lower.contains("invalid api key")
+            || text_lower.contains("invalid access token")
+            || text_lower.contains("token expired")
+            || text_lower.contains("401")
+        {
+            return " Provider authentication failed or expired — run `opencode auth login` or pick a free `opencode/*` model.";
+        }
+    }
+
+    if text_lower.contains("login")
+        || text_lower.contains("unauthorized")
+        || text_lower.contains("expired")
+        || text_lower.contains("credentials")
+        || text_lower.contains("authenticate")
+        || text_lower.contains("sso")
+    {
+        if provider_str == "kiro" {
+            return " Your Kiro session may need sign-in — run `kiro-cli login` in a terminal.";
+        }
+        return " Your CLI session may require authentication.";
+    }
+    ""
+}
+
 fn format_friendly_cli_error(provider_str: &str, err: &AgentHubError) -> String {
     let label = provider_display_label(provider_str);
     match err {
@@ -653,33 +807,26 @@ fn format_friendly_cli_error(provider_str: &str, err: &AgentHubError) -> String 
             stderr,
             ..
         } => {
-            let combined = format!("{stderr}\n{stdout}");
-            let lower = combined.to_ascii_lowercase();
-            let auth_hint = if lower.contains("login")
-                || lower.contains("unauthorized")
-                || lower.contains("expired")
-                || lower.contains("credentials")
-                || lower.contains("authenticate")
-                || lower.contains("sso")
-            {
-                if provider_str == "kiro" {
-                    " Your Kiro session may need sign-in — run `kiro-cli login` in a terminal."
+            let extracted = extract_cli_error_detail(stdout, stderr);
+            let combined = format!(
+                "{}\n{}\n{}",
+                extracted.as_deref().unwrap_or(""),
+                stderr,
+                stdout
+            );
+            let hint = build_cli_error_hint(provider_str, &combined.to_ascii_lowercase());
+            let raw_detail = extracted.unwrap_or_else(|| {
+                if !stderr.trim().is_empty() {
+                    stderr.trim().to_string()
                 } else {
-                    " Your CLI session may require authentication."
+                    stdout.trim().to_string()
                 }
-            } else {
-                ""
-            };
-            let detail_src = if !stderr.trim().is_empty() {
-                stderr.as_str()
-            } else {
-                stdout.as_str()
-            };
-            let detail = truncate_snippet(detail_src, 320);
+            });
+            let detail = truncate_snippet(&raw_detail, 320);
             if detail.is_empty() {
-                format!("{label} exited with status {exit_code:?}.{auth_hint}")
+                format!("{label} exited with status {exit_code:?}.{hint}")
             } else {
-                format!("{label} exited with status {exit_code:?}: {detail}{auth_hint}")
+                format!("{label} exited with status {exit_code:?}: {detail}{hint}")
             }
         }
         other => format!("{label} failed: {other}"),
@@ -719,6 +866,143 @@ fn make_error_response(
     })
 }
 
+const PREFERRED_OPENCODE_FREE_MODELS: [&str; 5] = [
+    "opencode/big-pickle",
+    "opencode/glm-5.3-flash-free",
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/flint-40b-free",
+    "opencode/beam-free",
+];
+
+fn strip_ansi_codes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+pub fn prioritize_opencode_models(raw_models: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for m in raw_models {
+        let stripped = strip_ansi_codes(&m).trim().to_string();
+        if stripped.is_empty() || !stripped.contains('/') || stripped.chars().any(char::is_whitespace) {
+            continue;
+        }
+        if seen.insert(stripped.clone()) {
+            unique.push(stripped);
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(unique.len());
+    let mut picked = HashSet::new();
+
+    for pref in PREFERRED_OPENCODE_FREE_MODELS {
+        if let Some(found) = unique.iter().find(|m| m.eq_ignore_ascii_case(pref)) {
+            picked.insert(found.clone());
+            ordered.push(found.clone());
+        }
+    }
+
+    let mut other_free: Vec<String> = unique
+        .iter()
+        .filter(|m| !picked.contains(*m) && m.starts_with("opencode/"))
+        .cloned()
+        .collect();
+    other_free.sort();
+    for m in other_free {
+        picked.insert(m.clone());
+        ordered.push(m);
+    }
+
+    for m in unique {
+        if !picked.contains(&m) {
+            ordered.push(m);
+        }
+    }
+
+    ordered
+}
+
+pub async fn list_opencode_models_async() -> Vec<String> {
+    let Ok(resolved) = DefaultCommandResolver.resolve("opencode") else {
+        return Vec::new();
+    };
+
+    let mut args = resolved.prefix_args.clone();
+    args.push("models".to_string());
+
+    let mut cmd = tokio::process::Command::new(&resolved.program);
+    cmd.args(&args)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if env::var_os("OPENCODE_CONFIG_CONTENT").is_none() {
+        cmd.env("OPENCODE_CONFIG_CONTENT", build_opencode_isolated_config());
+    }
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines = text.lines().map(ToString::to_string).collect();
+    prioritize_opencode_models(lines)
+}
+
+fn is_recoverable_opencode_error(stdout: &str, stderr: &str) -> bool {
+    let lower = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    [
+        "providermodelnotfounderror",
+        "model not found",
+        "subscription is required",
+        "free usage limit reached",
+        "unexpected server error",
+        "maximum number of items is 128",
+        "invalid api key",
+        "invalid access token",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn stdout_has_opencode_error_only(stdout: &str) -> bool {
+    if extract_assistant_text(stdout).is_some() {
+        return false;
+    }
+    stdout.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('{')
+            && serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "error"))
+                .unwrap_or(false)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_real_advisor_async(
     provider_str: &str,
     prompt: &str,
@@ -727,6 +1011,7 @@ pub async fn run_real_advisor_async(
     target_size_bytes: Option<u64>,
     custom_command: Option<&str>,
     active_drive: Option<&str>,
+    model: Option<&str>,
 ) -> Value {
     let trimmed_prompt = prompt.trim();
     let explicit_target = target_path.map(str::trim).filter(|s| !s.is_empty());
@@ -897,12 +1182,57 @@ pub async fn run_real_advisor_async(
         },
     );
 
-    let raw = match runner
-        .run_raw_prompt(&provider, &prompt_to_send, &context_json, None)
-        .await
-    {
+    let requested_model = model.map(str::trim).filter(|m| !m.is_empty());
+    let mut used_model = requested_model.map(ToString::to_string);
+
+    let mut attempt = runner
+        .run_raw_prompt_with_options(&provider, &prompt_to_send, &context_json, requested_model, None)
+        .await;
+
+    let should_fallback_opencode = provider_str == "opencode"
+        && requested_model.is_none()
+        && match &attempt {
+            Err(AgentHubError::ProcessFailed { stdout, stderr, .. }) => {
+                is_recoverable_opencode_error(stdout, stderr)
+            }
+            Ok(out) => stdout_has_opencode_error_only(&out.stdout),
+            _ => false,
+        };
+
+    if should_fallback_opencode {
+        let models = list_opencode_models_async().await;
+        let fallback_candidates: Vec<String> = models
+            .into_iter()
+            .filter(|m| m.starts_with("opencode/"))
+            .take(2)
+            .collect();
+
+        for candidate in fallback_candidates {
+            let retry = runner
+                .run_raw_prompt_with_options(
+                    &provider,
+                    &prompt_to_send,
+                    &context_json,
+                    Some(&candidate),
+                    None,
+                )
+                .await;
+            used_model = Some(candidate);
+            let retry_ok = matches!(&retry, Ok(out) if !stdout_has_opencode_error_only(&out.stdout));
+            attempt = retry;
+            if retry_ok {
+                break;
+            }
+        }
+    }
+
+    let raw = match attempt {
         Ok(out) => out,
         Err(err) => {
+            let err_cmd = match &used_model {
+                Some(m) => format!("{default_cmd_label} ({m})"),
+                None => default_cmd_label,
+            };
             return make_error_response(
                 provider_str,
                 trimmed_prompt,
@@ -911,7 +1241,7 @@ pub async fn run_real_advisor_async(
                 resolved_size_bytes,
                 format_friendly_cli_error(provider_str, &err),
                 install_hint,
-                Some(default_cmd_label),
+                Some(err_cmd),
             );
         }
     };
@@ -922,6 +1252,29 @@ pub async fn run_real_advisor_async(
         .and_then(|n| n.to_str())
         .map(ToString::to_string)
         .unwrap_or(default_cmd_label);
+    let display_cmd = match &used_model {
+        Some(m) => format!("{invoked_cmd} ({m})"),
+        None => invoked_cmd.clone(),
+    };
+
+    if stdout_has_opencode_error_only(&raw.stdout) {
+        let detail = extract_cli_error_detail(&raw.stdout, &raw.stderr)
+            .unwrap_or_else(|| format!("{display_cmd} returned an API error."));
+        let hint = build_cli_error_hint(
+            provider_str,
+            &format!("{detail}\n{}\n{}", raw.stderr, raw.stdout).to_ascii_lowercase(),
+        );
+        return make_error_response(
+            provider_str,
+            trimmed_prompt,
+            &resolved_target_path,
+            &resolved_name,
+            resolved_size_bytes,
+            format!("{detail}{hint}"),
+            install_hint,
+            Some(display_cmd),
+        );
+    }
 
     if let Ok(parsed) = parse_and_validate_advisor_response(&raw.stdout) {
         let verdict = match parsed.verdict {
@@ -964,7 +1317,7 @@ pub async fn run_real_advisor_async(
             "userPrompt": trimmed_prompt,
             "responseMode": "verdict",
             "isLiveCli": true,
-            "resolvedCommand": invoked_cmd,
+            "resolvedCommand": display_cmd,
             "durationMs": raw.duration_ms as u64,
         });
     }
@@ -979,7 +1332,7 @@ pub async fn run_real_advisor_async(
                         "url": url,
                         "domain": domain,
                         "verified": true,
-                        "snippet": format!("Referenced in {invoked_cmd} response"),
+                        "snippet": format!("Referenced in {display_cmd} response"),
                     })
                 })
                 .collect();
@@ -996,7 +1349,7 @@ pub async fn run_real_advisor_async(
                 "usage_value_assessment": reply_text,
                 "rationale": format!(
                     "Live reply from {} ({:.1}s)",
-                    invoked_cmd,
+                    display_cmd,
                     (raw.duration_ms as f64) / 1000.0
                 ),
                 "sources": sources,
@@ -1005,7 +1358,7 @@ pub async fn run_real_advisor_async(
                 "responseMode": "chat",
                 "assistantReply": reply_text,
                 "isLiveCli": true,
-                "resolvedCommand": invoked_cmd,
+                "resolvedCommand": display_cmd,
                 "durationMs": raw.duration_ms as u64,
             });
         }
@@ -1013,9 +1366,9 @@ pub async fn run_real_advisor_async(
 
     let stderr_snippet = truncate_snippet(&raw.stderr, 260);
     let empty_err = if stderr_snippet.is_empty() {
-        format!("{invoked_cmd} exited cleanly but produced no readable assistant reply.")
+        format!("{display_cmd} exited cleanly but produced no readable assistant reply.")
     } else {
-        format!("{invoked_cmd} produced no readable assistant reply ({stderr_snippet}).")
+        format!("{display_cmd} produced no readable assistant reply ({stderr_snippet}).")
     };
     make_error_response(
         provider_str,
@@ -1025,7 +1378,7 @@ pub async fn run_real_advisor_async(
         resolved_size_bytes,
         empty_err,
         install_hint,
-        Some(invoked_cmd),
+        Some(display_cmd),
     )
 }
 
@@ -1179,6 +1532,7 @@ mod tests {
             None,
             None,
             Some("C:\\"),
+            None,
         )
         .await;
         println!("LIVE CHAT: {chat_res}");
@@ -1196,6 +1550,7 @@ mod tests {
             None,
             None,
             Some("C:\\"),
+            None,
         )
         .await;
         println!("LIVE INSPECT: {inspect_res}");
@@ -1203,6 +1558,74 @@ mod tests {
         assert!(
             matches!(inspect_res["responseMode"].as_str(), Some("chat" | "verdict")),
             "unexpected inspect response: {inspect_res}"
+        );
+    }
+
+    #[test]
+    fn extracts_clean_opencode_error_details_and_prioritizes_models() {
+        let stderr_not_found = concat!(
+            "timestamp=2026-11-19T09:41:39.836Z level=ERROR run=9f3a52b2 message=failed ref=err_1 ",
+            r#"error="ProviderModelNotFoundError: Model not found: opencode/muse-spark-1.3-contributor-free. Did you mean: beam-free?\n    at <anonymous>" cause="...""#
+        );
+        let stdout_generic = r#"{"type":"error","timestamp":1,"error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details."}}}"#;
+        assert_eq!(
+            extract_cli_error_detail(stdout_generic, stderr_not_found).as_deref(),
+            Some("ProviderModelNotFoundError: Model not found: opencode/muse-spark-1.3-contributor-free. Did you mean: beam-free?")
+        );
+
+        let stdout_api_err = r#"{"type":"error","timestamp":1,"error":{"name":"APIError","data":{"message":"An active OpenCode Go subscription is required to use OpenCode Go models.","statusCode":403}}}"#;
+        assert_eq!(
+            extract_cli_error_detail(stdout_api_err, "").as_deref(),
+            Some("An active OpenCode Go subscription is required to use OpenCode Go models.")
+        );
+
+        let stderr_rate_limit = r#"timestamp=2026-11-19T09:46:36.318Z level=ERROR run=c6813b83 message="stream error" providerID=opencode modelID=big-pickle error.error="AI_APICallError: Free usage limit reached. Free models work in OpenCode (https://opencode.ai)""#;
+        assert_eq!(
+            extract_cli_error_detail("", stderr_rate_limit).as_deref(),
+            Some("Free usage limit reached. Free models work in OpenCode (https://opencode.ai)")
+        );
+
+        let prioritized = prioritize_opencode_models(vec![
+            "opencode-go/claude-haiku-5-5".to_string(),
+            "opencode/beam-free".to_string(),
+            "opencode/big-pickle".to_string(),
+            "minimax/MiniMax-M3".to_string(),
+            "opencode/big-pickle".to_string(),
+        ]);
+        assert_eq!(
+            prioritized,
+            vec![
+                "opencode/big-pickle",
+                "opencode/beam-free",
+                "opencode-go/claude-haiku-5-5",
+                "minimax/MiniMax-M3",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Invokes live local opencode CLI process with network access"]
+    async fn live_opencode_cli_smoke() {
+        let models = list_opencode_models_async().await;
+        println!("LIVE OPENCODE MODELS COUNT: {}", models.len());
+        assert!(!models.is_empty(), "expected opencode models list");
+
+        let chat_res = run_real_advisor_async(
+            "opencode",
+            "Reply with one short sentence saying hello from OpenCode CLI.",
+            None,
+            None,
+            None,
+            None,
+            Some("C:\\"),
+            None,
+        )
+        .await;
+        println!("LIVE OPENCODE CHAT (Auto fallback): {chat_res}");
+        assert_eq!(chat_res["isLiveCli"], json!(true));
+        assert!(
+            matches!(chat_res["responseMode"].as_str(), Some("chat" | "verdict")),
+            "unexpected opencode chat response: {chat_res}"
         );
     }
 }

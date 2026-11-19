@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde_json::{Map, Value};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -282,11 +283,21 @@ impl AgentProvider {
     }
 
     /// Adapts invocation arguments when the resolved OS binary uses a newer or alternate
-    /// CLI entry point (for example `kiro-cli.exe` v3 or `agy.EXE`).
+    /// CLI entry point (for example `kiro-cli.exe` v3, `agy.EXE`, or `opencode.exe`).
     pub fn adapt_args_for_resolved_binary(
         &self,
         resolved_program: &Path,
         input: &InvocationInput<'_>,
+    ) -> Option<Vec<String>> {
+        self.adapt_args_for_resolved_binary_with_model(resolved_program, input, None)
+    }
+
+    /// Adapts invocation arguments for a resolved binary with an optional provider-specific model override.
+    pub fn adapt_args_for_resolved_binary_with_model(
+        &self,
+        resolved_program: &Path,
+        input: &InvocationInput<'_>,
+        model_override: Option<&str>,
     ) -> Option<Vec<String>> {
         let stem = resolved_program
             .file_stem()
@@ -309,6 +320,22 @@ impl AgentProvider {
                 "--output-format".to_string(),
                 "json".to_string(),
             ]),
+            (AgentProvider::OpenCode, Some("opencode")) => {
+                let mut args = vec![
+                    "run".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                    "--print-logs".to_string(),
+                    "--log-level".to_string(),
+                    "ERROR".to_string(),
+                ];
+                if let Some(model) = model_override.map(str::trim).filter(|m| !m.is_empty()) {
+                    args.push("-m".to_string());
+                    args.push(model.to_string());
+                }
+                args.push(input.prompt.to_string());
+                Some(args)
+            }
             _ => None,
         }
     }
@@ -572,6 +599,169 @@ pub fn default_search_dirs_and_exts() -> SearchDirsAndExts {
     }
 
     (dirs, exts, extra)
+}
+
+fn strip_jsonc_comments_and_trailing_commas(input: &str) -> String {
+    let mut no_comments = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            no_comments.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            no_comments.push(ch);
+            continue;
+        }
+
+        if ch == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    let _ = chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            no_comments.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    let _ = chars.next();
+                    let mut prev_star = false;
+                    for c in chars.by_ref() {
+                        if prev_star && c == '/' {
+                            break;
+                        }
+                        prev_star = c == '*';
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        no_comments.push(ch);
+    }
+
+    // Strip trailing commas before `}` or `]` outside double-quoted strings.
+    let mut cleaned = String::with_capacity(no_comments.len());
+    let mut c_iter = no_comments.chars().peekable();
+    in_string = false;
+    escaped = false;
+
+    while let Some(ch) = c_iter.next() {
+        if in_string {
+            cleaned.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            cleaned.push(ch);
+            continue;
+        }
+        if ch == ',' {
+            let mut lookahead = c_iter.clone();
+            while let Some(&next_ch) = lookahead.peek() {
+                if next_ch.is_whitespace() {
+                    let _ = lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            if matches!(lookahead.peek(), Some('}' | ']')) {
+                continue;
+            }
+        }
+        cleaned.push(ch);
+    }
+
+    cleaned
+}
+
+/// Builds a subprocess-only `OPENCODE_CONFIG_CONTENT` JSON override from raw OpenCode config
+/// texts, explicitly disabling discovered MCP servers (avoiding >128 tool overflows and startup
+/// stalls) and enforcing read-only (`edit: deny`, `bash: deny`) permissions.
+pub fn build_opencode_isolated_config_from_contents(config_texts: &[&str]) -> String {
+    let mut mcp_names = BTreeSet::new();
+
+    for raw in config_texts {
+        let stripped = strip_jsonc_comments_and_trailing_commas(raw);
+        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&stripped) else {
+            continue;
+        };
+        if let Some(Value::Object(mcp_obj)) = root.get("mcp") {
+            for key in mcp_obj.keys() {
+                if !key.trim().is_empty() {
+                    mcp_names.insert(key.clone());
+                }
+            }
+        }
+    }
+
+    let mut root = Map::new();
+    if !mcp_names.is_empty() {
+        let mut mcp_map = Map::new();
+        for name in mcp_names {
+            let mut entry = Map::new();
+            entry.insert("enabled".to_string(), Value::Bool(false));
+            mcp_map.insert(name, Value::Object(entry));
+        }
+        root.insert("mcp".to_string(), Value::Object(mcp_map));
+    }
+
+    let mut permission = Map::new();
+    permission.insert("edit".to_string(), Value::String("deny".to_string()));
+    permission.insert("bash".to_string(), Value::String("deny".to_string()));
+    root.insert("permission".to_string(), Value::Object(permission));
+
+    Value::Object(root).to_string()
+}
+
+/// Reads user OpenCode config file(s) from standard locations (extracting only top-level `"mcp"`
+/// server names, never reading/logging secrets) and builds a subprocess-only isolated config JSON.
+pub fn build_opencode_isolated_config() -> String {
+    let mut contents = Vec::new();
+    let base_profile = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+
+    if let Some(home) = base_profile {
+        let candidates = [
+            home.join(".config").join("opencode").join("opencode.json"),
+            home.join(".config").join("opencode").join("opencode.jsonc"),
+            home.join(".config").join("opencode").join("config.json"),
+            home.join(".opencode").join("opencode.json"),
+            home.join(".opencode").join("opencode.jsonc"),
+        ];
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                contents.push(text);
+            }
+        }
+    }
+
+    let refs: Vec<&str> = contents.iter().map(String::as_str).collect();
+    build_opencode_isolated_config_from_contents(&refs)
 }
 
 #[cfg(test)]
@@ -842,5 +1032,78 @@ mod tests {
             .is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builds_opencode_isolated_config_from_json_and_jsonc_and_adapts_opencode_args() {
+        let cfg1 = r#"
+        {
+          // main user opencode config
+          "model": "opencode/muse-spark-1.3-contributor-free",
+          "mcp": {
+            "browseros-neo": { "type": "remote", "url": "http://localhost:9222/mcp" },
+            "storage-agent": { "type": "local", "command": ["node", "agent.js"] },
+          },
+        }"#;
+        let cfg2 = r#"
+        {
+          /* secondary config */
+          "mcp": {
+            "rea": { "enabled": true },
+            "ghidra-mcp": { "enabled": true }
+          }
+        }"#;
+
+        let isolated_str = build_opencode_isolated_config_from_contents(&[cfg1, cfg2]);
+        let isolated: Value = serde_json::from_str(&isolated_str).expect("valid json");
+        assert_eq!(isolated["mcp"]["browseros-neo"]["enabled"], Value::Bool(false));
+        assert_eq!(isolated["mcp"]["storage-agent"]["enabled"], Value::Bool(false));
+        assert_eq!(isolated["mcp"]["rea"]["enabled"], Value::Bool(false));
+        assert_eq!(isolated["mcp"]["ghidra-mcp"]["enabled"], Value::Bool(false));
+        assert_eq!(isolated["permission"]["edit"], Value::String("deny".to_string()));
+        assert_eq!(isolated["permission"]["bash"], Value::String("deny".to_string()));
+
+        // No MCPs -> omits mcp key, keeps read-only permission.
+        let bare: Value =
+            serde_json::from_str(&build_opencode_isolated_config_from_contents(&[])).unwrap();
+        assert!(bare.get("mcp").is_none());
+        assert_eq!(bare["permission"]["bash"], Value::String("deny".to_string()));
+
+        let input = InvocationInput {
+            prompt: "Say hello",
+            context_json: "{}",
+            prompt_file_path: None,
+        };
+        let opencode_exe = Path::new(r"C:\Users\thinh\AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode.exe");
+        assert_eq!(
+            AgentProvider::OpenCode
+                .adapt_args_for_resolved_binary_with_model(opencode_exe, &input, None)
+                .unwrap(),
+            vec!["run", "--format", "json", "--print-logs", "--log-level", "ERROR", "Say hello"]
+        );
+        assert_eq!(
+            AgentProvider::OpenCode
+                .adapt_args_for_resolved_binary_with_model(
+                    opencode_exe,
+                    &input,
+                    Some("  opencode/big-pickle  ")
+                )
+                .unwrap(),
+            vec![
+                "run",
+                "--format",
+                "json",
+                "--print-logs",
+                "--log-level",
+                "ERROR",
+                "-m",
+                "opencode/big-pickle",
+                "Say hello"
+            ]
+        );
+        // Mock wrapper running under node.exe keeps build_command_spec args untouched.
+        assert!(AgentProvider::OpenCode
+            .adapt_args_for_resolved_binary_with_model(Path::new("node.exe"), &input, Some("opencode/big-pickle"))
+            .is_none());
     }
 }

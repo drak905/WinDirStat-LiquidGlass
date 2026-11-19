@@ -285,6 +285,7 @@ const defaultBridge: WdsBridge = {
       targetSizeBytes: params.targetSizeBytes,
       customCommand: params.customCommand,
       activeDrive: params.activeDrive,
+      model: params.model,
     };
 
     if (isTauriRuntime()) {
@@ -336,6 +337,18 @@ const defaultBridge: WdsBridge = {
     if (native) return native;
     await new Promise((resolve) => setTimeout(resolve, 120));
     return buildSimulatedAdvice(params);
+  },
+
+  async listOpenCodeModels(): Promise<string[]> {
+    const native = await tryTauriInvoke<string[]>('list_opencode_models');
+    if (native && native.length > 0) return native;
+    if (isTauriRuntime()) return [];
+    return [
+      'opencode/big-pickle',
+      'opencode/glm-5.3-flash-free',
+      'opencode/deepseek-v4.1-flash-free',
+      'opencode/beam-free',
+    ];
   },
 
   async testAgentCli(provider: AgentProvider, customCommand?: string): Promise<AgentCliTestResult> {

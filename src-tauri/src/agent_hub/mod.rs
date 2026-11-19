@@ -10,6 +10,7 @@ pub mod validator;
 pub use context::{ContextError, ExtensionStat, LockedHandleStatus, StorageContextPayload};
 pub use prompt::build_cross_check_system_prompt;
 pub use providers::{
+    build_opencode_isolated_config, build_opencode_isolated_config_from_contents,
     default_search_dirs_and_exts, discover_all_provider_statuses, discover_available_providers,
     discover_providers_in, resolve_binary_in_dirs, AgentProvider, AgentProviderKind,
     CliInvocationSpec, CustomCliConfig, DiscoveredProvider, InvocationInput, ProviderError,

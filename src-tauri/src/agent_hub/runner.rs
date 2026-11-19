@@ -1,8 +1,8 @@
 use crate::agent_hub::context::{ContextError, StorageContextPayload};
 use crate::agent_hub::prompt::build_cross_check_system_prompt;
 use crate::agent_hub::providers::{
-    default_search_dirs_and_exts, resolve_binary_in_dirs, AgentProvider, AgentProviderKind,
-    InvocationInput, ProviderError,
+    build_opencode_isolated_config, default_search_dirs_and_exts, resolve_binary_in_dirs,
+    AgentProvider, AgentProviderKind, InvocationInput, ProviderError,
 };
 use crate::agent_hub::validator::{
     parse_and_validate_advisor_response, AdvisorResponse, ValidationError,
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 static TEMP_PROMPT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -367,12 +367,26 @@ impl AgentHubRunner {
     }
 
     /// Executes an Agent CLI with a prompt and optional context JSON, adapting binary-specific
-    /// flags when resolved to alternate aliases (`kiro-cli`, `agy`) and returning raw stdout/stderr.
+    /// flags when resolved to alternate aliases (`kiro-cli`, `agy`, `opencode`) and returning raw stdout/stderr.
     pub async fn run_raw_prompt(
         &self,
         provider: &AgentProvider,
         prompt: &str,
         context_json: &str,
+        stream_tx: Option<mpsc::UnboundedSender<StreamChunk>>,
+    ) -> Result<RawChatExecutionOutput, AgentHubError> {
+        self.run_raw_prompt_with_options(provider, prompt, context_json, None, stream_tx)
+            .await
+    }
+
+    /// Executes an Agent CLI with an optional provider-specific model override, isolated per-provider
+    /// env overrides (for OpenCode MCP isolation), and early abort on known fatal retry loops.
+    pub async fn run_raw_prompt_with_options(
+        &self,
+        provider: &AgentProvider,
+        prompt: &str,
+        context_json: &str,
+        model_override: Option<&str>,
         stream_tx: Option<mpsc::UnboundedSender<StreamChunk>>,
     ) -> Result<RawChatExecutionOutput, AgentHubError> {
         let _prompt_guard = if provider.requires_prompt_file() {
@@ -390,14 +404,31 @@ impl AgentHubRunner {
         let spec = provider.build_command_spec(&inv_input)?;
         let resolved = self.resolver.resolve(&spec.program)?;
         let effective_args = provider
-            .adapt_args_for_resolved_binary(&resolved.program, &inv_input)
+            .adapt_args_for_resolved_binary_with_model(&resolved.program, &inv_input, model_override)
             .unwrap_or(spec.args);
 
+        let is_opencode_exe = matches!(provider, AgentProvider::OpenCode)
+            && resolved
+                .program
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("opencode"));
+        let mut env_overrides = Vec::new();
+        if is_opencode_exe && std::env::var_os("OPENCODE_CONFIG_CONTENT").is_none() {
+            env_overrides.push((
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                build_opencode_isolated_config(),
+            ));
+        }
+
+        let abort_on_fatal_stderr = matches!(provider, AgentProvider::OpenCode);
         let raw = execute_subprocess(
             &resolved,
             &effective_args,
             spec.working_dir.as_deref(),
+            &env_overrides,
             self.config.timeout,
+            abort_on_fatal_stderr,
             stream_tx,
         )
         .await?;
@@ -473,7 +504,9 @@ impl AgentHubRunner {
             &resolved,
             &probe_args,
             working_dir.as_deref(),
+            &[],
             self.config.self_test_timeout,
+            false,
             None,
         )
         .await
@@ -509,7 +542,9 @@ async fn execute_subprocess(
     resolved: &ResolvedCommand,
     spec_args: &[String],
     working_dir: Option<&Path>,
+    env_overrides: &[(String, String)],
     timeout: Duration,
+    abort_on_fatal_stderr: bool,
     stream_tx: Option<mpsc::UnboundedSender<StreamChunk>>,
 ) -> Result<RawProcessOutput, AgentHubError> {
     let started = Instant::now();
@@ -523,6 +558,10 @@ async fn execute_subprocess(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    for (key, val) in env_overrides {
+        cmd.env(key, val);
+    }
 
     #[cfg(windows)]
     {
@@ -554,13 +593,45 @@ async fn execute_subprocess(
             reason: "failed to capture stderr".to_string(),
         })?;
 
-    let stdout_task = tokio::spawn(drain_stream(stdout_pipe, StreamSource::Stdout, stream_tx.clone()));
-    let stderr_task = tokio::spawn(drain_stream(stderr_pipe, StreamSource::Stderr, stream_tx));
+    let (fatal_tx, fatal_rx) = if abort_on_fatal_stderr {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
-    let wait_res = tokio::time::timeout(timeout, child.wait()).await;
-    let status = match wait_res {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
+    let stdout_task = tokio::spawn(drain_stream(
+        stdout_pipe,
+        StreamSource::Stdout,
+        stream_tx.clone(),
+        None,
+    ));
+    let stderr_task = tokio::spawn(drain_stream(
+        stderr_pipe,
+        StreamSource::Stderr,
+        stream_tx,
+        fatal_tx,
+    ));
+
+    enum WaitOutcome {
+        Process(Result<std::process::ExitStatus, std::io::Error>),
+        TimedOut,
+        FatalStderr,
+    }
+
+    let outcome = tokio::select! {
+        res = tokio::time::timeout(timeout, child.wait()) => {
+            match res {
+                Ok(status_res) => WaitOutcome::Process(status_res),
+                Err(_) => WaitOutcome::TimedOut,
+            }
+        }
+        _ = await_fatal_trigger(fatal_rx) => WaitOutcome::FatalStderr,
+    };
+
+    let (status, aborted_on_fatal) = match outcome {
+        WaitOutcome::Process(Ok(status)) => (status, false),
+        WaitOutcome::Process(Err(e)) => {
             stdout_task.abort();
             stderr_task.abort();
             return Err(AgentHubError::SpawnFailed {
@@ -568,7 +639,7 @@ async fn execute_subprocess(
                 reason: e.to_string(),
             });
         }
-        Err(_) => {
+        WaitOutcome::TimedOut => {
             let _ = child.kill().await;
             let _ = child.wait().await;
             stdout_task.abort();
@@ -578,26 +649,76 @@ async fn execute_subprocess(
                 timeout_ms: timeout.as_millis(),
             });
         }
+        WaitOutcome::FatalStderr => {
+            let status = match tokio::time::timeout(Duration::from_millis(1500), child.wait()).await
+            {
+                Ok(Ok(status)) => status,
+                _ => {
+                    let _ = child.kill().await;
+                    child.wait().await.map_err(|e| {
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        AgentHubError::SpawnFailed {
+                            program: resolved.program.display().to_string(),
+                            reason: e.to_string(),
+                        }
+                    })?
+                }
+            };
+            (status, true)
+        }
     };
 
-    let stdout = stdout_task.await.unwrap_or_default();
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stdout = tokio::time::timeout(Duration::from_secs(2), stdout_task)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+    let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_task)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
 
     Ok(RawProcessOutput {
         program: resolved.program.clone(),
         args: full_args,
         exit_code: status.code(),
-        success: status.success(),
+        success: status.success() && !aborted_on_fatal,
         stdout,
         stderr,
         duration_ms: started.elapsed().as_millis(),
     })
 }
 
+async fn await_fatal_trigger(rx: Option<oneshot::Receiver<()>>) {
+    match rx {
+        Some(rx) => {
+            if rx.await.is_ok() {
+                return;
+            }
+            std::future::pending::<()>().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn is_fatal_opencode_stderr_line(line: &str) -> bool {
+    const FATAL_MARKERS: [&str; 5] = [
+        "Free usage limit reached",
+        "subscription is required",
+        "ProviderModelNotFoundError",
+        "AI_APICallError: invalid api key",
+        "invalid access token or token expired",
+    ];
+    FATAL_MARKERS.iter().any(|marker| line.contains(marker))
+}
+
 async fn drain_stream<R: AsyncRead + Unpin>(
     reader: R,
     source: StreamSource,
     stream_tx: Option<mpsc::UnboundedSender<StreamChunk>>,
+    mut fatal_tx: Option<oneshot::Sender<()>>,
 ) -> String {
     let mut lines = BufReader::new(reader).lines();
     let mut accumulated = String::new();
@@ -607,6 +728,11 @@ async fn drain_stream<R: AsyncRead + Unpin>(
                 source,
                 line: line.clone(),
             });
+        }
+        if matches!(source, StreamSource::Stderr) && is_fatal_opencode_stderr_line(&line) {
+            if let Some(tx) = fatal_tx.take() {
+                let _ = tx.send(());
+            }
         }
         accumulated.push_str(&line);
         accumulated.push('\n');
@@ -674,5 +800,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn aborts_hanging_opencode_retry_loop_on_fatal_stderr() {
+        let (dirs, exts, _) = default_search_dirs_and_exts();
+        let node_exe = resolve_binary_in_dirs("node", &dirs, &exts)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
+        if !node_exe.is_file() {
+            return;
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "wds-opencode-abort-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hang_after_error.js");
+        std::fs::write(
+            &script,
+            r#"console.error('timestamp=2026-11-19T09:46:36Z level=ERROR error.error="AI_APICallError: Free usage limit reached"'); setTimeout(() => {}, 15000);"#,
+        )
+        .unwrap();
+
+        let mut resolver = OverrideCommandResolver::new(false);
+        resolver.insert(
+            "opencode",
+            ResolvedCommand::with_prefix(node_exe, vec![script.to_string_lossy().into_owned()]),
+        );
+
+        let runner = AgentHubRunner::with_resolver(
+            Arc::new(resolver),
+            RunnerConfig {
+                timeout: Duration::from_secs(30),
+                self_test_timeout: Duration::from_secs(5),
+            },
+        );
+        let started = Instant::now();
+        let err = runner
+            .run_raw_prompt(&AgentProvider::OpenCode, "Hello", "{}", None)
+            .await
+            .expect_err("expected early ProcessFailed abort");
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expected early abort under 5s, took {elapsed:?}"
+        );
+        match err {
+            AgentHubError::ProcessFailed { stderr, .. } => {
+                assert!(stderr.contains("Free usage limit reached"), "stderr={stderr}");
+            }
+            other => panic!("expected ProcessFailed, got {other:?}"),
+        }
     }
 }

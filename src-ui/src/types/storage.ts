@@ -141,6 +141,7 @@ export interface AskAgentAdvisorParams {
   targetSizeBytes?: number;
   customCommand?: string;
   activeDrive?: string;
+  model?: string;
 }
 
 export interface AgentCliTestResult {
@@ -164,6 +165,7 @@ export interface WdsBridge {
   findDuplicates(target: string): Promise<DuplicateGroup[]>;
   detectAgentClis(): Promise<AgentProviderStatus[]>;
   askAgentAdvisor(params: AskAgentAdvisorParams): Promise<AgentAdvisorResponse>;
+  listOpenCodeModels?(): Promise<string[]>;
   testAgentCli?(provider: AgentProvider, customCommand?: string): Promise<AgentCliTestResult>;
   quarantineItem(params: QuarantineItemParams): Promise<VaultItem>;
   listVaultItems(): Promise<VaultItem[]>;

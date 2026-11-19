@@ -9,10 +9,10 @@ use serde_json::Value;
 use tauri::State;
 
 use windirstat_liquid_glass::desktop_api::{
-    default_app_data_dir, detect_ui_providers, find_real_duplicates, list_real_vault_items,
-    quarantine_real_item, query_windows_drives, rollback_real_vault_item, run_real_advisor_async,
-    scan_directory_snapshot, test_agent_cli_async, AppContext, UiAgentProviderStatus, UiDriveInfo,
-    UiDuplicateGroup, UiScanSnapshot, UiVaultItem,
+    default_app_data_dir, detect_ui_providers, find_real_duplicates, list_opencode_models_async,
+    list_real_vault_items, quarantine_real_item, query_windows_drives, rollback_real_vault_item,
+    run_real_advisor_async, scan_directory_snapshot, test_agent_cli_async, AppContext,
+    UiAgentProviderStatus, UiDriveInfo, UiDuplicateGroup, UiScanSnapshot, UiVaultItem,
 };
 use windirstat_liquid_glass::vault::service::start_expiration_worker;
 
@@ -159,6 +159,7 @@ async fn ask_agent_advisor(
     target_size_bytes: Option<u64>,
     custom_command: Option<String>,
     active_drive: Option<String>,
+    model: Option<String>,
 ) -> Value {
     run_real_advisor_async(
         &provider,
@@ -168,8 +169,14 @@ async fn ask_agent_advisor(
         target_size_bytes,
         custom_command.as_deref(),
         active_drive.as_deref(),
+        model.as_deref(),
     )
     .await
+}
+
+#[tauri::command]
+async fn list_opencode_models() -> Vec<String> {
+    list_opencode_models_async().await
 }
 
 #[tauri::command]
@@ -254,6 +261,7 @@ fn main() {
             find_duplicates,
             detect_agent_clis,
             ask_agent_advisor,
+            list_opencode_models,
             test_agent_cli,
             quarantine_item,
             list_vault_items,
