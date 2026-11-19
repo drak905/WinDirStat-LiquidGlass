@@ -17,10 +17,10 @@ pub use providers::{
 };
 pub use runner::{
     AgentHubError, AgentHubRunner, CommandResolver, ConnectivityReport, DefaultCommandResolver,
-    ExecutionOutput, OverrideCommandResolver, ResolvedCommand, RunnerConfig, StreamChunk,
-    StreamSource,
+    ExecutionOutput, OverrideCommandResolver, RawChatExecutionOutput, ResolvedCommand, RunnerConfig,
+    StreamChunk, StreamSource,
 };
 pub use validator::{
-    parse_and_validate_advisor_response, AdvisorResponse, AdvisorVerdict, CrossCheckedSource,
-    ValidationError,
+    extract_assistant_text, extract_external_urls_from_text, parse_and_validate_advisor_response,
+    AdvisorResponse, AdvisorVerdict, CrossCheckedSource, ValidationError,
 };

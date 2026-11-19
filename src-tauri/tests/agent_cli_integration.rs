@@ -136,6 +136,26 @@ if (mode === 'kiro') {
   process.exit(0);
 }
 
+if (mode === 'kiro-cli') {
+  if (
+    args[1] !== 'chat' ||
+    args[2] !== '--no-interactive' ||
+    args[3] !== '--trust-workspace' ||
+    args[4] !== '--trust-tools=fs_read,web_search,web_fetch' ||
+    args[5] !== '--output-format' ||
+    args[6] !== 'stream-json'
+  ) {
+    console.error('Unexpected kiro-cli args: ' + JSON.stringify(args));
+    process.exit(2);
+  }
+  assertContains(args[7], 'Source Type A', 'prompt');
+  const fenced = "```json\n" + JSON.stringify(validPayload) + "\n```";
+  console.log(JSON.stringify({ type: 'runStarted', data: { payloadSchema: 'acp', engine: 'v3' } }));
+  console.log(JSON.stringify({ type: 'sessionUpdate', data: { sessionId: 'sess_mock', update: { sessionUpdate: 'session_info_update' } } }));
+  console.log(JSON.stringify({ type: 'runFinished', data: { sessionId: 'sess_mock', status: 'success', finalText: fenced } }));
+  process.exit(0);
+}
+
 if (mode === 'claude') {
   if (args[1] !== '-p' || args[3] !== '--output-format' || args[4] !== 'stream-json' || args[5] !== '--allowedTools' || args[6] !== 'WebSearch,WebFetch,Read') {
     console.error('Unexpected claude args: ' + JSON.stringify(args));
@@ -496,9 +516,14 @@ async fn self_tests_discovered_host_providers_when_installed() {
     for item in discovered {
         if matches!(
             item.kind,
-            AgentProviderKind::Codex | AgentProviderKind::OpenCode
+            AgentProviderKind::Kiro
+                | AgentProviderKind::Antigravity
+                | AgentProviderKind::Codex
+                | AgentProviderKind::OpenCode
         ) {
             let provider = match item.kind {
+                AgentProviderKind::Kiro => AgentProvider::Kiro,
+                AgentProviderKind::Antigravity => AgentProvider::Antigravity,
                 AgentProviderKind::Codex => AgentProvider::Codex,
                 AgentProviderKind::OpenCode => AgentProvider::OpenCode,
                 _ => continue,
@@ -511,4 +536,43 @@ async fn self_tests_discovered_host_providers_when_installed() {
             assert!(!report.stdout.trim().is_empty());
         }
     }
+}
+
+#[tokio::test]
+async fn executes_kiro_cli_acp_stream_json_via_runner() {
+    use windirstat_liquid_glass::agent_hub::InvocationInput;
+
+    let dir = TempDirGuard::new("kiro-cli-acp");
+    let node_exe = find_node_exe();
+    let script_path = write_mock_node_script(&dir, "mock-agent.js");
+    let payload = sample_payload();
+
+    let adapted_args = AgentProvider::Kiro
+        .adapt_args_for_resolved_binary(
+            Path::new("kiro-cli.exe"),
+            &InvocationInput {
+                prompt: "{{PROMPT}}",
+                context_json: "{{CONTEXT_JSON}}",
+                prompt_file_path: None,
+            },
+        )
+        .expect("kiro-cli adapted args");
+
+    let mut template_args = vec![
+        script_path.to_string_lossy().into_owned(),
+        "kiro-cli".to_string(),
+    ];
+    template_args.extend(adapted_args);
+
+    let kiro_acp = AgentProvider::Custom(CustomCliConfig::new(
+        node_exe.to_string_lossy().into_owned(),
+        template_args,
+    ));
+    let runner = AgentHubRunner::new();
+    let output = runner
+        .run_advisor(&kiro_acp, &payload, None)
+        .await
+        .expect("kiro-cli ACP run");
+    assert_eq!(output.response.verdict, AdvisorVerdict::SafeToDelete);
+    assert_eq!(output.response.cross_checked_sources.len(), 3);
 }

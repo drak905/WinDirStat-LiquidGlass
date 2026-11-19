@@ -115,4 +115,104 @@ describe('Agent CLI Storage Advisor Chat', () => {
     await user.click(screen.getByTestId('agent-quarantine-btn'));
     expect(onQuarantine).toHaveBeenCalledWith(response);
   });
+
+  it('supports switching to kiro, shows honest status pills, and renders chat and error response modes cleanly', async () => {
+    const user = userEvent.setup();
+    const onProviderChange = vi.fn();
+    const kiroChatResponse: AgentAdvisorResponse = {
+      id: 'kiro-chat-1',
+      targetPath: 'General Storage Inquiry',
+      targetName: 'General Storage Inquiry',
+      targetSizeBytes: 0,
+      provider: 'kiro',
+      verdict: 'REVIEW_CAREFULLY',
+      risk_score: 0,
+      reclaimable_bytes: 0,
+      usage_value_assessment: 'Kiro CLI live reply: Keep Windows Update caches unless running Disk Cleanup.',
+      rationale: 'Live reply from kiro-cli.exe (2.4s)',
+      sources: [
+        {
+          title: 'learn.microsoft.com',
+          url: 'https://learn.microsoft.com/en-us/windows/win32/shell/disk-cleanup',
+          domain: 'learn.microsoft.com',
+          verified: true,
+          snippet: 'Referenced in kiro-cli.exe response',
+        },
+      ],
+      createdAt: new Date().toISOString(),
+      userPrompt: 'Hello Kiro CLI, how should I free space safely?',
+      responseMode: 'chat',
+      assistantReply: 'Kiro CLI live reply: Keep Windows Update caches unless running Disk Cleanup.',
+      isLiveCli: true,
+      resolvedCommand: 'kiro-cli.exe',
+      durationMs: 2400,
+    };
+
+    const kiroErrorResponse: AgentAdvisorResponse = {
+      id: 'kiro-err-1',
+      targetPath: 'General Storage Inquiry',
+      targetName: 'General Storage Inquiry',
+      targetSizeBytes: 0,
+      provider: 'claude',
+      verdict: 'REVIEW_CAREFULLY',
+      risk_score: 0,
+      reclaimable_bytes: 0,
+      usage_value_assessment: 'Claude Code CLI was not found on PATH.',
+      rationale: 'Claude Code CLI was not found on PATH.',
+      sources: [],
+      createdAt: new Date().toISOString(),
+      userPrompt: 'Test offline CLI',
+      responseMode: 'error',
+      isLiveCli: false,
+      resolvedCommand: 'claude',
+      error: 'Claude Code CLI was not found on PATH.',
+      installHint: 'npm install -g @anthropic-ai/claude-code',
+    };
+
+    const { rerender } = render(
+      <AgentAdvisorPanel
+        providers={[
+          { provider: 'antigravity', displayName: 'Antigravity CLI', available: true, command: 'agy', latencyMs: 42 },
+          { provider: 'kiro', displayName: 'Kiro CLI', available: true, command: 'kiro-cli', latencyMs: 45, resolvedPath: 'C:\\Users\\thinh\\AppData\\Local\\Kiro-Cli\\kiro-cli.exe' },
+          { provider: 'claude', displayName: 'Claude Code CLI', available: false, command: 'claude', latencyMs: 0, installHint: 'npm install -g @anthropic-ai/claude-code' },
+        ]}
+        selectedProvider="kiro"
+        onProviderChange={onProviderChange}
+        responses={[kiroChatResponse]}
+        isStreaming={false}
+        onSendPrompt={async () => {}}
+        onQuarantineRecommended={async () => {}}
+      />
+    );
+
+    expect(screen.getByTestId('agent-status-pill')).toHaveTextContent(/Connected.*kiro-cli/i);
+    expect(screen.getByTestId('agent-user-prompt')).toHaveTextContent('Hello Kiro CLI, how should I free space safely?');
+    expect(screen.getByTestId('agent-live-badge')).toHaveTextContent(/Live CLI.*kiro-cli\.exe.*2\.4s/);
+    expect(screen.getByTestId('agent-chat-card')).toHaveTextContent('Kiro CLI live reply');
+    expect(screen.queryByTestId('agent-quarantine-btn')).not.toBeInTheDocument();
+
+    // Switching selector to another option calls onProviderChange
+    await user.selectOptions(screen.getByTestId('agent-provider-select'), 'claude');
+    expect(onProviderChange).toHaveBeenCalledWith('claude');
+
+    // When unavailable provider is active, Not Installed status pill and banner appear alongside error card
+    rerender(
+      <AgentAdvisorPanel
+        providers={[
+          { provider: 'kiro', displayName: 'Kiro CLI', available: true, command: 'kiro-cli', latencyMs: 45 },
+          { provider: 'claude', displayName: 'Claude Code CLI', available: false, command: 'claude', latencyMs: 0, installHint: 'npm install -g @anthropic-ai/claude-code' },
+        ]}
+        selectedProvider="claude"
+        onProviderChange={onProviderChange}
+        responses={[kiroErrorResponse]}
+        isStreaming={false}
+        onSendPrompt={async () => {}}
+        onQuarantineRecommended={async () => {}}
+      />
+    );
+
+    expect(screen.getByTestId('agent-status-pill')).toHaveTextContent('Not Installed');
+    expect(screen.getByTestId('agent-unavailable-banner')).toHaveTextContent('npm install -g @anthropic-ai/claude-code');
+    expect(screen.getByTestId('agent-error-card')).toHaveTextContent('Claude Code CLI was not found on PATH.');
+  });
 });

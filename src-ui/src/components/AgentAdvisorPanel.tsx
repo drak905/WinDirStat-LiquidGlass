@@ -6,8 +6,10 @@ import {
   ExternalLink,
   CheckCircle2,
   Wifi,
+  WifiOff,
   AlertTriangle,
   Sparkles,
+  RefreshCw,
 } from 'lucide-react';
 import type {
   AgentAdvisorResponse,
@@ -27,8 +29,12 @@ interface AgentAdvisorPanelProps {
   onSendPrompt: (params: {
     provider: AgentProvider;
     prompt: string;
+    targetPath?: string;
+    targetName?: string;
+    targetSizeBytes?: number;
     customCommand?: string;
   }) => Promise<unknown>;
+  onRefreshProviders?: () => Promise<void>;
   onQuarantineRecommended: (response: AgentAdvisorResponse) => Promise<void>;
 }
 
@@ -58,13 +64,16 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
   responses,
   isStreaming,
   onSendPrompt,
+  onRefreshProviders,
   onQuarantineRecommended,
 }) => {
   const [promptInput, setPromptInput] = useState('');
   const [customCmd, setCustomCmd] = useState('my-local-agent --json');
   const [quarantinedIds, setQuarantinedIds] = useState<Record<string, boolean>>({});
+  const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
 
   const activeProviderStatus = providers.find((p) => p.provider === selectedProvider);
+  const availableBuiltins = providers.filter((p) => p.available && p.provider !== 'custom');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -78,57 +87,146 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
     });
   };
 
+  const handleRefreshProviders = async () => {
+    if (!onRefreshProviders || isRefreshingProviders) return;
+    setIsRefreshingProviders(true);
+    try {
+      await onRefreshProviders();
+    } finally {
+      setIsRefreshingProviders(false);
+    }
+  };
+
+  const renderStatusPill = () => {
+    if (providers.length === 0) {
+      return (
+        <div
+          data-testid="agent-status-pill"
+          className="flex items-center gap-1.5 rounded-full border border-white/25 bg-white/15 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-300"
+        >
+          <Wifi className="h-3 w-3 animate-pulse" />
+          <span>Checking CLIs…</span>
+        </div>
+      );
+    }
+    if (activeProviderStatus?.available) {
+      return (
+        <div
+          data-testid="agent-status-pill"
+          title={activeProviderStatus.resolvedPath ?? activeProviderStatus.command}
+          className="flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300"
+        >
+          <Wifi className="h-3 w-3" />
+          <span>
+            Connected &bull; {activeProviderStatus.command}
+            {activeProviderStatus.latencyMs ? ` • ${activeProviderStatus.latencyMs}ms` : ''}
+          </span>
+        </div>
+      );
+    }
+    return (
+      <div
+        data-testid="agent-status-pill"
+        title={activeProviderStatus?.installHint}
+        className="flex items-center gap-1.5 rounded-full border border-amber-400/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-medium text-amber-800 dark:text-amber-300"
+      >
+        <WifiOff className="h-3 w-3" />
+        <span>Not Installed</span>
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
       {/* Header & Provider Selector */}
-      <div className="liquid-glass-card flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-3">
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-sky-400/30 to-indigo-500/30 text-sky-400">
-            <Bot className="h-5 w-5" />
+      <div className="liquid-glass-card flex flex-col gap-2.5 rounded-2xl px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-sky-400/30 to-indigo-500/30 text-sky-400">
+              <Bot className="h-5 w-5" />
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-slate-900 dark:text-white">
+                Agent CLI Storage Advisor
+              </div>
+              <div className="text-[11px] text-slate-600 dark:text-slate-400">
+                Pluggable local CLI router with &ge;3 internet cross-checked references
+              </div>
+            </div>
           </div>
-          <div>
-            <div className="text-xs font-semibold text-slate-900 dark:text-white">
-              Agent CLI Storage Advisor
-            </div>
-            <div className="text-[11px] text-slate-600 dark:text-slate-400">
-              Pluggable local CLI router with &ge;3 internet cross-checked references
-            </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {renderStatusPill()}
+
+            {onRefreshProviders && (
+              <button
+                type="button"
+                aria-label="Refresh detected Agent CLIs"
+                onClick={() => void handleRefreshProviders()}
+                disabled={isRefreshingProviders}
+                title="Re-scan local Agent CLIs on this PC"
+                className="flex h-7 w-7 items-center justify-center rounded-xl border border-white/20 bg-white/15 text-slate-700 hover:bg-white/25 disabled:opacity-50 dark:text-slate-200"
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 ${isRefreshingProviders ? 'animate-spin' : ''}`}
+                />
+              </button>
+            )}
+
+            <select
+              data-testid="agent-provider-select"
+              aria-label="Agent CLI Provider"
+              value={selectedProvider}
+              onChange={(e) => onProviderChange(e.target.value as AgentProvider)}
+              className="rounded-xl border border-white/25 bg-white/25 px-3 py-1.5 text-xs font-semibold text-slate-900 outline-none focus:ring-2 focus:ring-sky-400/60 dark:bg-slate-900/75 dark:text-slate-100"
+            >
+              {AGENT_PROVIDERS.map((p) => (
+                <option key={p.id} value={p.id} className="bg-slate-900 text-slate-100">
+                  {p.label}
+                </option>
+              ))}
+            </select>
+
+            {selectedProvider === 'custom' && (
+              <input
+                type="text"
+                value={customCmd}
+                onChange={(e) => setCustomCmd(e.target.value)}
+                placeholder="Custom CLI binary..."
+                className="w-44 rounded-xl border border-white/25 bg-white/20 px-2.5 py-1.5 font-mono text-[11px] text-slate-900 outline-none dark:bg-black/30 dark:text-slate-100"
+              />
+            )}
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-            <Wifi className="h-3 w-3" />
-            <span>
-              {activeProviderStatus?.available ? 'Connected' : 'Ready (Adapter)'}
-              {activeProviderStatus?.latencyMs ? ` • ${activeProviderStatus.latencyMs}ms` : ''}
-            </span>
-          </div>
-
-          <select
-            data-testid="agent-provider-select"
-            aria-label="Agent CLI Provider"
-            value={selectedProvider}
-            onChange={(e) => onProviderChange(e.target.value as AgentProvider)}
-            className="rounded-xl border border-white/25 bg-white/25 px-3 py-1.5 text-xs font-semibold text-slate-900 outline-none focus:ring-2 focus:ring-sky-400/60 dark:bg-slate-900/75 dark:text-slate-100"
+        {activeProviderStatus && !activeProviderStatus.available && (
+          <div
+            data-testid="agent-unavailable-banner"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-900 dark:text-amber-200"
           >
-            {AGENT_PROVIDERS.map((p) => (
-              <option key={p.id} value={p.id} className="bg-slate-900 text-slate-100">
-                {p.label}
-              </option>
-            ))}
-          </select>
-
-          {selectedProvider === 'custom' && (
-            <input
-              type="text"
-              value={customCmd}
-              onChange={(e) => setCustomCmd(e.target.value)}
-              placeholder="Custom CLI binary..."
-              className="w-44 rounded-xl border border-white/25 bg-white/20 px-2.5 py-1.5 font-mono text-[11px] text-slate-900 outline-none dark:bg-black/30 dark:text-slate-100"
-            />
-          )}
-        </div>
+            <div>
+              <strong>{activeProviderStatus.displayName}</strong> was not detected on this PC.{' '}
+              {activeProviderStatus.installHint && (
+                <span className="opacity-90">{activeProviderStatus.installHint}</span>
+              )}
+            </div>
+            {availableBuiltins.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="opacity-80">Switch to detected CLI:</span>
+                {availableBuiltins.map((p) => (
+                  <button
+                    key={p.provider}
+                    type="button"
+                    onClick={() => onProviderChange(p.provider)}
+                    className="rounded-lg border border-emerald-400/40 bg-emerald-500/20 px-2 py-0.5 font-semibold text-emerald-800 hover:bg-emerald-500/30 dark:text-emerald-200"
+                  >
+                    {p.displayName}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Streaming Response Cards Feed */}
@@ -137,7 +235,11 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
           <div className="liquid-glass-card liquid-spring-enter flex items-center gap-3 rounded-3xl p-4 text-xs">
             <Sparkles className="h-4 w-4 animate-pulse text-sky-400" />
             <span className="font-medium text-slate-800 dark:text-slate-200">
-              Streaming verdict from <strong className="font-mono">{selectedProvider}</strong> CLI &amp; cross-checking external sources…
+              Running{' '}
+              <strong className="font-mono">
+                {activeProviderStatus?.command ?? selectedProvider}
+              </strong>{' '}
+              CLI&hellip; (live queries can take 10&ndash;40s)
             </span>
           </div>
         )}
@@ -151,7 +253,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
               </div>
               <p className="text-xs text-slate-600 dark:text-slate-400">
                 Right-click any file, folder, or extension in the Treemap, or ask directly below.
-                Every verdict cross-checks at least 3 authoritative documentation URLs.
+                Every path verdict cross-checks at least 3 authoritative documentation URLs.
               </p>
             </div>
             <div className="flex flex-wrap justify-center gap-2">
@@ -163,8 +265,9 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
                 <button
                   key={suggestion}
                   type="button"
+                  disabled={isStreaming}
                   onClick={() => void onSendPrompt({ provider: selectedProvider, prompt: suggestion })}
-                  className="rounded-xl border border-white/20 bg-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-800 hover:bg-white/25 dark:text-slate-200"
+                  className="rounded-xl border border-white/20 bg-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-800 hover:bg-white/25 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-200"
                 >
                   {suggestion}
                 </button>
@@ -174,11 +277,133 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
         ) : (
           responses.map((resp) => {
             const isQuarantined = Boolean(quarantinedIds[resp.id]);
+            const mode = resp.responseMode ?? 'verdict';
+
+            const renderHeaderMeta = () => (
+              <>
+                {resp.userPrompt && (
+                  <div
+                    data-testid="agent-user-prompt"
+                    className="mb-2.5 rounded-xl border border-white/15 bg-white/10 px-3 py-1.5 text-[11px] text-slate-700 dark:bg-black/25 dark:text-slate-300"
+                  >
+                    <span className="font-semibold text-slate-900 dark:text-white">You: </span>
+                    {resp.userPrompt}
+                  </div>
+                )}
+              </>
+            );
+
+            const renderLiveBadge = () =>
+              resp.isLiveCli ? (
+                <span
+                  data-testid="agent-live-badge"
+                  className="rounded-lg border border-emerald-400/35 bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-700 dark:text-emerald-300"
+                >
+                  Live CLI &bull; {resp.resolvedCommand ?? resp.provider}
+                  {resp.durationMs ? ` • ${(resp.durationMs / 1000).toFixed(1)}s` : ''}
+                </span>
+              ) : null;
+
+            const renderSourcesGrid = (sources: AgentAdvisorResponse['sources']) => (
+              <div className="mt-3">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                  Cross-Checked External Sources ({sources.length})
+                </div>
+                <div
+                  data-testid="agent-sources-list"
+                  className="grid grid-cols-1 gap-2 md:grid-cols-3"
+                >
+                  {sources.map((src) => (
+                    <a
+                      key={src.url}
+                      href={src.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="group flex flex-col justify-between rounded-2xl border border-white/15 bg-white/10 p-2.5 text-xs transition hover:border-sky-400/50 hover:bg-white/20 dark:bg-black/25"
+                    >
+                      <div>
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-300">
+                            <CheckCircle2 className="h-3 w-3" />
+                            {src.domain}
+                          </span>
+                          <ExternalLink className="h-3 w-3 text-slate-400 group-hover:text-sky-400" />
+                        </div>
+                        <div className="mt-1 line-clamp-2 font-medium text-slate-900 dark:text-slate-100">
+                          {src.title}
+                        </div>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-[10px] text-slate-600 dark:text-slate-400">
+                        {src.snippet}
+                      </p>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            );
+
+            if (mode === 'error') {
+              return (
+                <article
+                  key={resp.id}
+                  data-testid="agent-error-card"
+                  className="liquid-glass-card liquid-spring-enter rounded-3xl border border-rose-400/40 p-4"
+                >
+                  {renderHeaderMeta()}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-rose-400/40 bg-rose-500/20 px-2.5 py-0.5 text-[11px] font-bold tracking-wide text-rose-800 dark:text-rose-200">
+                      CLI ERROR
+                    </span>
+                    <span className="rounded-lg bg-white/15 px-2 py-0.5 font-mono text-[10px] text-slate-700 dark:text-slate-300">
+                      provider: {resp.resolvedCommand ?? resp.provider}
+                    </span>
+                  </div>
+                  <p className="mt-2.5 whitespace-pre-wrap break-words text-xs font-medium text-rose-900 dark:text-rose-200">
+                    {resp.error || resp.rationale}
+                  </p>
+                  {resp.installHint && (
+                    <div className="mt-2 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-900 dark:text-amber-200">
+                      <strong>Hint:</strong> {resp.installHint}
+                    </div>
+                  )}
+                </article>
+              );
+            }
+
+            if (mode === 'chat') {
+              const replyBody = resp.assistantReply || resp.usage_value_assessment;
+              return (
+                <article
+                  key={resp.id}
+                  data-testid="agent-chat-card"
+                  className="liquid-glass-card liquid-spring-enter rounded-3xl p-4"
+                >
+                  {renderHeaderMeta()}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-sky-400/40 bg-sky-500/20 px-2.5 py-0.5 text-[11px] font-bold tracking-wide text-sky-800 dark:text-sky-200">
+                      AGENT REPLY
+                    </span>
+                    <span className="rounded-lg bg-white/15 px-2 py-0.5 font-mono text-[10px] text-slate-700 dark:text-slate-300">
+                      provider: {resp.provider}
+                    </span>
+                    {renderLiveBadge()}
+                  </div>
+
+                  <div className="mt-3 whitespace-pre-wrap break-words rounded-2xl border border-white/15 bg-white/10 p-3 text-xs leading-relaxed text-slate-800 dark:bg-black/20 dark:text-slate-200">
+                    {replyBody}
+                  </div>
+
+                  {resp.sources.length > 0 && renderSourcesGrid(resp.sources)}
+                </article>
+              );
+            }
+
             return (
               <article
                 key={resp.id}
                 className="liquid-glass-card liquid-spring-enter rounded-3xl p-4"
               >
+                {renderHeaderMeta()}
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
@@ -191,6 +416,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
                       <span className="rounded-lg bg-white/15 px-2 py-0.5 font-mono text-[10px] text-slate-700 dark:text-slate-300">
                         provider: {resp.provider}
                       </span>
+                      {renderLiveBadge()}
                       <span className="font-mono text-xs font-bold text-sky-600 dark:text-sky-300">
                         Reclaimable: {formatBytes(resp.reclaimable_bytes)}
                       </span>
@@ -228,50 +454,16 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
                     <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
                     Usage Value Assessment
                   </div>
-                  <p className="leading-relaxed text-slate-700 dark:text-slate-300">
+                  <p className="whitespace-pre-wrap break-words leading-relaxed text-slate-700 dark:text-slate-300">
                     {resp.usage_value_assessment}
                   </p>
-                  <p className="mt-1 text-[11px] text-slate-600 dark:text-slate-400">
+                  <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-600 dark:text-slate-400">
                     {resp.rationale}
                   </p>
                 </div>
 
                 {/* Verified Cross-Checked External Source URLs (>= 3) */}
-                <div className="mt-3">
-                  <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
-                    Cross-Checked External Sources ({resp.sources.length})
-                  </div>
-                  <div
-                    data-testid="agent-sources-list"
-                    className="grid grid-cols-1 gap-2 md:grid-cols-3"
-                  >
-                    {resp.sources.map((src) => (
-                      <a
-                        key={src.url}
-                        href={src.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="group flex flex-col justify-between rounded-2xl border border-white/15 bg-white/10 p-2.5 text-xs transition hover:border-sky-400/50 hover:bg-white/20 dark:bg-black/25"
-                      >
-                        <div>
-                          <div className="flex items-center justify-between gap-1">
-                            <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-300">
-                              <CheckCircle2 className="h-3 w-3" />
-                              {src.domain}
-                            </span>
-                            <ExternalLink className="h-3 w-3 text-slate-400 group-hover:text-sky-400" />
-                          </div>
-                          <div className="mt-1 line-clamp-2 font-medium text-slate-900 dark:text-slate-100">
-                            {src.title}
-                          </div>
-                        </div>
-                        <p className="mt-1 line-clamp-2 text-[10px] text-slate-600 dark:text-slate-400">
-                          {src.snippet}
-                        </p>
-                      </a>
-                    ))}
-                  </div>
-                </div>
+                {resp.sources.length > 0 && renderSourcesGrid(resp.sources)}
 
                 {/* 1-Click Quarantine Action */}
                 <div className="mt-3 flex items-center justify-end gap-2">
@@ -307,7 +499,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
           data-testid="agent-chat-input"
           value={promptInput}
           onChange={(e) => setPromptInput(e.target.value)}
-          placeholder={`Ask ${selectedProvider} CLI whether a path is safe to delete or keep…`}
+          placeholder={`Ask ${activeProviderStatus?.command ?? selectedProvider} CLI a question or enter a Windows path…`}
           className="flex-1 bg-transparent px-3 py-2 text-xs text-slate-900 placeholder-slate-500 outline-none dark:text-slate-100"
         />
         <button

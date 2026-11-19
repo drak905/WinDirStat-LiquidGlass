@@ -272,6 +272,26 @@ fn extract_text_from_event_value(
             collect_message_content(field, messages);
         }
     }
+
+    // Kiro CLI v3 ACP stream-json events (`runFinished.data.finalText` and `agent_message_chunk`)
+    if let Some(data) = obj.get("data").and_then(|v| v.as_object()) {
+        if let Some(final_text) = data.get("finalText").and_then(|v| v.as_str()) {
+            if !final_text.trim().is_empty() {
+                messages.push(final_text.to_string());
+            }
+        }
+        if let Some(update) = data.get("update").and_then(|v| v.as_object()) {
+            if update.get("sessionUpdate").and_then(|v| v.as_str()) == Some("agent_message_chunk") {
+                if let Some(chunk_text) = update
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(|v| v.as_str())
+                {
+                    delta_stream.push_str(chunk_text);
+                }
+            }
+        }
+    }
 }
 
 fn collect_message_content(val: &Value, messages: &mut Vec<String>) {
@@ -388,6 +408,27 @@ fn find_matching_brace_end(text: &str, start_idx: usize) -> Option<usize> {
     None
 }
 
+fn extract_non_empty_text_field(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Array(items) => {
+            let lines: Vec<&str> = items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .collect();
+            if lines.is_empty() || lines.len() != items.len() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn validate_advisor_object(obj: &Map<String, Value>) -> Result<AdvisorResponse, ValidationError> {
     let verdict_raw = obj
         .get("verdict")
@@ -420,21 +461,16 @@ fn validate_advisor_object(obj: &Map<String, Value>) -> Result<AdvisorResponse, 
 
     let usage_value_assessment = obj
         .get("usage_value_assessment")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or(ValidationError::EmptyUsageValueAssessment)?
-        .to_string();
+        .and_then(extract_non_empty_text_field)
+        .ok_or(ValidationError::EmptyUsageValueAssessment)?;
 
     let recommended_action_raw = obj
         .get("recommended_action")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .and_then(extract_non_empty_text_field)
         .ok_or(ValidationError::EmptyRecommendedAction)?;
 
     let recommended_action =
-        validate_and_enforce_quarantine(verdict, recommended_action_raw)?;
+        validate_and_enforce_quarantine(verdict, &recommended_action_raw)?;
 
     let sources_arr = obj
         .get("cross_checked_sources")
@@ -688,7 +724,10 @@ fn validate_and_enforce_quarantine(
 
     for term in DESTRUCTIVE_TERMS {
         if let Some(pos) = lower.find(term) {
-            let prefix_start = pos.saturating_sub(48);
+            let mut prefix_start = pos.saturating_sub(48);
+            while prefix_start > 0 && !lower.is_char_boundary(prefix_start) {
+                prefix_start -= 1;
+            }
             let context_before = &lower[prefix_start..pos];
             let negated = [
                 "rather than",
@@ -714,6 +753,135 @@ fn validate_and_enforce_quarantine(
     } else {
         Ok(recommended_action.to_string())
     }
+}
+
+/// Extracts clean assistant prose/Markdown text from raw Agent CLI output
+/// (NDJSON/ACP stream-json, single JSON envelope, or plain text with ANSI codes stripped).
+pub fn extract_assistant_text(raw_output: &str) -> Option<String> {
+    let trimmed = raw_output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut messages = Vec::new();
+    let mut delta_stream = String::new();
+    let mut saw_json_event = false;
+
+    if let Ok(val @ Value::Object(_)) = serde_json::from_str::<Value>(trimmed) {
+        saw_json_event = true;
+        extract_text_from_event_value(&val, &mut messages, &mut delta_stream);
+    } else {
+        for line in trimmed.lines() {
+            let line_trimmed = line.trim();
+            if !line_trimmed.starts_with('{') {
+                continue;
+            }
+            if let Ok(val @ Value::Object(_)) = serde_json::from_str::<Value>(line_trimmed) {
+                saw_json_event = true;
+                extract_text_from_event_value(&val, &mut messages, &mut delta_stream);
+            }
+        }
+    }
+
+    if let Some(last_msg) = messages.into_iter().rev().find(|m| !m.trim().is_empty()) {
+        return Some(strip_ansi_escape_sequences(&last_msg).trim().to_string());
+    }
+    if !delta_stream.trim().is_empty() {
+        return Some(strip_ansi_escape_sequences(&delta_stream).trim().to_string());
+    }
+
+    // Fallback: filter out any JSON stream envelopes so raw sessionUpdate JSON never leaks to UI.
+    let kept_lines: Vec<String> = trimmed
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            if t.is_empty() {
+                return None;
+            }
+            if t.starts_with('{') {
+                if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(t) {
+                    if is_stream_envelope(&obj) || obj.contains_key("data") {
+                        return None;
+                    }
+                }
+            }
+            Some(strip_ansi_escape_sequences(line))
+        })
+        .collect();
+
+    if saw_json_event && kept_lines.is_empty() {
+        return None;
+    }
+
+    let joined = kept_lines.join("\n").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// Extracts and validates deduplicated public `http://`/`https://` URLs with their domain
+/// from conversational assistant output.
+pub fn extract_external_urls_from_text(text: &str) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+    let mut search_from = 0;
+
+    while search_from < text.len() {
+        let rest = &text[search_from..];
+        let next_https = rest.find("https://");
+        let next_http = rest.find("http://");
+        let rel = match (next_https, next_http) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let url_start = search_from + rel;
+        let url_slice = &text[url_start..];
+        let raw_end = url_slice
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>'))
+            .unwrap_or(url_slice.len());
+        let token = url_slice[..raw_end]
+            .trim_end_matches(&['.', ',', ')', ';', ']', '>', '"', '\'', '`'][..]);
+
+        if let Ok(normalized) = validate_and_normalize_external_url(0, token) {
+            if seen.insert(normalized.clone()) {
+                let domain = Url::parse(&normalized)
+                    .ok()
+                    .and_then(|u| u.host_str().map(ToString::to_string))
+                    .unwrap_or_default();
+                if !domain.is_empty() {
+                    results.push((normalized, domain));
+                }
+            }
+        }
+
+        search_from = url_start + raw_end.max(1);
+    }
+
+    results
+}
+
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1070,5 +1238,127 @@ mod tests {
                 Err(ValidationError::InvalidSourceUrl { index: 0, .. })
             ));
         }
+    }
+
+    #[test]
+    fn accepts_kiro_v3_acp_run_finished_final_text() {
+        let fenced = format!("```json\n{}\n```", valid_json_payload());
+        let stream = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"type":"runStarted","data":{"payloadSchema":"acp","engine":"v3"}}),
+            serde_json::json!({
+                "type":"sessionUpdate",
+                "data":{"sessionId":"sess_1","update":{"sessionUpdate":"session_info_update"}}
+            }),
+            serde_json::json!({
+                "type":"runFinished",
+                "data":{"sessionId":"sess_1","status":"success","finalText":fenced}
+            })
+        );
+        let parsed = parse_and_validate_advisor_response(&stream).expect("kiro runFinished");
+        assert_eq!(parsed.verdict, AdvisorVerdict::SafeToDelete);
+        assert_eq!(parsed.cross_checked_sources.len(), 3);
+    }
+
+    #[test]
+    fn accepts_kiro_v3_acp_agent_message_chunk_deltas() {
+        let fenced = format!("```json\n{}\n```", valid_json_payload());
+        let mid = fenced.len() / 2;
+        let (part1, part2) = fenced.split_at(mid);
+        let stream = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"type":"runStarted","data":{"engine":"v3"}}),
+            serde_json::json!({
+                "type":"sessionUpdate",
+                "data":{"sessionId":"sess_1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":part1}}}
+            }),
+            serde_json::json!({
+                "type":"sessionUpdate",
+                "data":{"sessionId":"sess_1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":part2}}}
+            })
+        );
+        let parsed = parse_and_validate_advisor_response(&stream).expect("kiro chunks");
+        assert_eq!(parsed.verdict, AdvisorVerdict::SafeToDelete);
+    }
+
+    #[test]
+    fn accepts_agy_json_envelope_response() {
+        let env = serde_json::json!({
+            "conversation_id": "2c611447-77af-41a7-888c-f197ff265df2",
+            "status": "SUCCESS",
+            "response": format!("Here is the verdict:\n```json\n{}\n```", valid_json_payload()),
+            "duration_seconds": 3.5
+        })
+        .to_string();
+        let parsed = parse_and_validate_advisor_response(&env).expect("agy json response");
+        assert_eq!(parsed.verdict, AdvisorVerdict::SafeToDelete);
+    }
+
+    #[test]
+    fn extracts_clean_conversational_text_and_urls_without_leaking_session_updates() {
+        let stream = format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({"type":"runStarted","data":{"engine":"v3"}}),
+            serde_json::json!({
+                "type":"sessionUpdate",
+                "data":{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","_meta":{"kiro":{"displayError":{"message":"MCP server failed"}}}}}
+            }),
+            serde_json::json!({
+                "type":"sessionUpdate",
+                "data":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"See https://learn.microsoft.com/en-us/windows/storage."}}}
+            }),
+            serde_json::json!({
+                "type":"runFinished",
+                "data":{"sessionId":"s1","status":"success","finalText":"See https://learn.microsoft.com/en-us/windows/storage and http://127.0.0.1/ignore."}
+            })
+        );
+
+        let text = extract_assistant_text(&stream).expect("clean assistant text");
+        assert_eq!(
+            text,
+            "See https://learn.microsoft.com/en-us/windows/storage and http://127.0.0.1/ignore."
+        );
+        assert!(!text.contains("sessionUpdate"));
+        assert!(!text.contains("MCP server failed"));
+
+        let urls = extract_external_urls_from_text(&text);
+        assert_eq!(
+            urls,
+            vec![(
+                "https://learn.microsoft.com/en-us/windows/storage".to_string(),
+                "learn.microsoft.com".to_string()
+            )]
+        );
+
+        // Stream containing only telemetry events (no finalText / chunks) returns None.
+        let telemetry_only = format!(
+            "{}\n",
+            serde_json::json!({"type":"sessionUpdate","data":{"sessionId":"s2","update":{"sessionUpdate":"session_info_update"}}})
+        );
+        assert!(extract_assistant_text(&telemetry_only).is_none());
+    }
+
+    #[test]
+    fn accepts_step_array_recommended_action_from_real_clis() {
+        let json = serde_json::json!({
+            "verdict": "CLEAN_VIA_OFFICIAL_TOOL",
+            "risk_score": 15,
+            "reclaimable_bytes": 0,
+            "usage_value_assessment": "Temp files inside C:\\Windows\\Temp.",
+            "cross_checked_sources": [
+                { "title": "S1", "url": "https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32", "source_type": "A", "finding": "Use Storage Sense." },
+                { "title": "S2", "url": "https://learn.microsoft.com/en-us/windows/configuration/storage/storage-sense", "source_type": "A", "finding": "Automatic cleanup." },
+                { "title": "S3", "url": "https://superuser.com/questions/173256/windows-7-what-is-windows-temp", "source_type": "C", "finding": "Skip locked files." }
+            ],
+            "recommended_action": [
+                "1. Close installers first.",
+                "2. Route unneeded files to the 7-Day Quarantine Vault rather than permanent Remove-Item."
+            ]
+        })
+        .to_string();
+
+        let parsed = parse_and_validate_advisor_response(&json).expect("array action");
+        assert!(parsed.recommended_action.contains("1. Close installers first."));
+        assert!(parsed.recommended_action.contains("7-Day Quarantine Vault"));
     }
 }

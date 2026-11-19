@@ -8,6 +8,7 @@ import {
 } from '../data/demoSnapshot';
 import type {
   AgentAdvisorResponse,
+  AgentCliTestResult,
   AgentProvider,
   AgentProviderStatus,
   AskAgentAdvisorParams,
@@ -225,6 +226,9 @@ function buildSimulatedAdvice(params: AskAgentAdvisorParams): AgentAdvisorRespon
     rationale,
     sources: buildSimulatedSources(targetPath),
     createdAt: new Date().toISOString(),
+    userPrompt: params.prompt,
+    responseMode: 'verdict',
+    isLiveCli: false,
   };
 }
 
@@ -273,15 +277,82 @@ const defaultBridge: WdsBridge = {
   },
 
   async askAgentAdvisor(params: AskAgentAdvisorParams): Promise<AgentAdvisorResponse> {
-    const native = await tryTauriInvoke<AgentAdvisorResponse>('ask_agent_advisor', {
+    const payload = {
       provider: params.provider,
       prompt: params.prompt,
       targetPath: params.targetPath,
+      targetName: params.targetName,
+      targetSizeBytes: params.targetSizeBytes,
       customCommand: params.customCommand,
-    });
+      activeDrive: params.activeDrive,
+    };
+
+    if (isTauriRuntime()) {
+      try {
+        const native = await invoke<AgentAdvisorResponse>('ask_agent_advisor', payload);
+        if (native) return native;
+        return {
+          id: `adv-err-${Date.now()}`,
+          targetPath: params.targetPath ?? params.activeDrive ?? 'General Storage Inquiry',
+          targetName: params.targetName ?? 'Agent CLI Error',
+          targetSizeBytes: params.targetSizeBytes ?? 0,
+          provider: params.provider,
+          verdict: 'REVIEW_CAREFULLY',
+          risk_score: 0,
+          reclaimable_bytes: 0,
+          usage_value_assessment: 'Desktop backend returned an empty response for ask_agent_advisor.',
+          rationale: 'Desktop backend returned an empty response.',
+          sources: [],
+          createdAt: new Date().toISOString(),
+          userPrompt: params.prompt,
+          responseMode: 'error',
+          isLiveCli: false,
+          error: 'Desktop backend returned an empty response for ask_agent_advisor.',
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          id: `adv-err-${Date.now()}`,
+          targetPath: params.targetPath ?? params.activeDrive ?? 'General Storage Inquiry',
+          targetName: params.targetName ?? 'Agent CLI Error',
+          targetSizeBytes: params.targetSizeBytes ?? 0,
+          provider: params.provider,
+          verdict: 'REVIEW_CAREFULLY',
+          risk_score: 0,
+          reclaimable_bytes: 0,
+          usage_value_assessment: msg,
+          rationale: msg,
+          sources: [],
+          createdAt: new Date().toISOString(),
+          userPrompt: params.prompt,
+          responseMode: 'error',
+          isLiveCli: false,
+          error: `Desktop IPC error invoking ${params.provider}: ${msg}`,
+        };
+      }
+    }
+
+    const native = await tryTauriInvoke<AgentAdvisorResponse>('ask_agent_advisor', payload);
     if (native) return native;
     await new Promise((resolve) => setTimeout(resolve, 120));
     return buildSimulatedAdvice(params);
+  },
+
+  async testAgentCli(provider: AgentProvider, customCommand?: string): Promise<AgentCliTestResult> {
+    const native = await tryTauriInvoke<AgentCliTestResult>('test_agent_cli', {
+      provider,
+      customCommand,
+    });
+    if (native) return native;
+    if (isTauriRuntime()) {
+      return { ok: false, error: 'Failed to invoke test_agent_cli on desktop backend.' };
+    }
+    return {
+      ok: true,
+      command: provider,
+      output: `${provider} simulated connectivity ok`,
+      durationMs: 12,
+    };
   },
 
   async quarantineItem(params: QuarantineItemParams): Promise<VaultItem> {

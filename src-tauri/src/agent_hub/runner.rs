@@ -107,11 +107,21 @@ impl CommandResolver for DefaultCommandResolver {
         let mut found = resolve_binary_in_dirs(trimmed, &dirs, &exts);
 
         if found.is_none() {
-            for (kind, candidates) in extra {
-                if kind.default_command().eq_ignore_ascii_case(trimmed) {
-                    found = candidates.into_iter().find(|p| p.is_file());
-                    if found.is_some() {
-                        break;
+            if let Some(kind) = AgentProviderKind::all_builtin()
+                .into_iter()
+                .find(|k| k.default_command().eq_ignore_ascii_case(trimmed))
+            {
+                for alias in kind.command_aliases() {
+                    if !alias.eq_ignore_ascii_case(trimmed) {
+                        found = resolve_binary_in_dirs(alias, &dirs, &exts);
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if found.is_none() {
+                    if let Some((_, candidates)) = extra.into_iter().find(|(k, _)| *k == kind) {
+                        found = candidates.into_iter().find(|p| p.is_file());
                     }
                 }
             }
@@ -271,6 +281,18 @@ pub struct ExecutionOutput {
     pub response: AdvisorResponse,
 }
 
+/// Raw subprocess execution output before strict advisor schema validation.
+#[derive(Debug, Clone)]
+pub struct RawChatExecutionOutput {
+    pub provider_kind: AgentProviderKind,
+    pub invoked_program: PathBuf,
+    pub invoked_args: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u128,
+}
+
 /// Result returned by [`AgentHubRunner::self_test_provider`].
 #[derive(Debug, Clone)]
 pub struct ConnectivityReport {
@@ -344,34 +366,36 @@ impl AgentHubRunner {
         Self { resolver, config }
     }
 
-    /// Executes the selected Agent CLI with injected Storage Context Payload and mandatory
-    /// multi-source cross-check system prompt, returning only strictly validated responses.
-    pub async fn run_advisor(
+    /// Executes an Agent CLI with a prompt and optional context JSON, adapting binary-specific
+    /// flags when resolved to alternate aliases (`kiro-cli`, `agy`) and returning raw stdout/stderr.
+    pub async fn run_raw_prompt(
         &self,
         provider: &AgentProvider,
-        payload: &StorageContextPayload,
+        prompt: &str,
+        context_json: &str,
         stream_tx: Option<mpsc::UnboundedSender<StreamChunk>>,
-    ) -> Result<ExecutionOutput, AgentHubError> {
-        payload.validate()?;
-        let context_json = payload.to_compact_json()?;
-        let prompt = build_cross_check_system_prompt(payload);
-
+    ) -> Result<RawChatExecutionOutput, AgentHubError> {
         let _prompt_guard = if provider.requires_prompt_file() {
-            Some(TempPromptFileGuard::create(&prompt).await?)
+            Some(TempPromptFileGuard::create(prompt).await?)
         } else {
             None
         };
 
-        let spec = provider.build_command_spec(&InvocationInput {
-            prompt: &prompt,
-            context_json: &context_json,
+        let inv_input = InvocationInput {
+            prompt,
+            context_json,
             prompt_file_path: _prompt_guard.as_ref().map(|g| g.path()),
-        })?;
+        };
 
+        let spec = provider.build_command_spec(&inv_input)?;
         let resolved = self.resolver.resolve(&spec.program)?;
+        let effective_args = provider
+            .adapt_args_for_resolved_binary(&resolved.program, &inv_input)
+            .unwrap_or(spec.args);
+
         let raw = execute_subprocess(
             &resolved,
-            &spec.args,
+            &effective_args,
             spec.working_dir.as_deref(),
             self.config.timeout,
             stream_tx,
@@ -387,11 +411,38 @@ impl AgentHubRunner {
             });
         }
 
-        let response = parse_and_validate_advisor_response(&raw.stdout)?;
-        Ok(ExecutionOutput {
+        Ok(RawChatExecutionOutput {
             provider_kind: spec.kind,
             invoked_program: raw.program,
             invoked_args: raw.args,
+            exit_code: raw.exit_code,
+            stdout: raw.stdout,
+            stderr: raw.stderr,
+            duration_ms: raw.duration_ms,
+        })
+    }
+
+    /// Executes the selected Agent CLI with injected Storage Context Payload and mandatory
+    /// multi-source cross-check system prompt, returning only strictly validated responses.
+    pub async fn run_advisor(
+        &self,
+        provider: &AgentProvider,
+        payload: &StorageContextPayload,
+        stream_tx: Option<mpsc::UnboundedSender<StreamChunk>>,
+    ) -> Result<ExecutionOutput, AgentHubError> {
+        payload.validate()?;
+        let context_json = payload.to_compact_json()?;
+        let prompt = build_cross_check_system_prompt(payload);
+
+        let raw = self
+            .run_raw_prompt(provider, &prompt, &context_json, stream_tx)
+            .await?;
+
+        let response = parse_and_validate_advisor_response(&raw.stdout)?;
+        Ok(ExecutionOutput {
+            provider_kind: raw.provider_kind,
+            invoked_program: raw.invoked_program,
+            invoked_args: raw.invoked_args,
             exit_code: raw.exit_code,
             stdout: raw.stdout,
             stderr: raw.stderr,
@@ -467,10 +518,17 @@ async fn execute_subprocess(
 
     let mut cmd = Command::new(&resolved.program);
     cmd.args(&full_args)
+        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);

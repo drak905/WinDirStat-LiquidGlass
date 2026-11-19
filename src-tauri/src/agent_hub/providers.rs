@@ -61,10 +61,25 @@ impl AgentProviderKind {
         }
     }
 
+    pub fn command_aliases(&self) -> &'static [&'static str] {
+        match self {
+            AgentProviderKind::Antigravity => &["antigravity", "agy"],
+            AgentProviderKind::Kiro => &["kiro-cli", "kiro"],
+            AgentProviderKind::Claude => &["claude"],
+            AgentProviderKind::Codex => &["codex"],
+            AgentProviderKind::OpenCode => &["opencode"],
+            AgentProviderKind::Custom => &["custom"],
+        }
+    }
+
     pub fn install_hint(&self) -> &'static str {
         match self {
-            AgentProviderKind::Antigravity => "Check Google Antigravity CLI PATH registration",
-            AgentProviderKind::Kiro => r"Check Kiro CLI binary in %LOCALAPPDATA%\Programs\Kiro",
+            AgentProviderKind::Antigravity => {
+                r"Install Antigravity CLI (`agy` / `antigravity`) or check %LOCALAPPDATA%\agy\bin\agy.EXE"
+            }
+            AgentProviderKind::Kiro => {
+                r"Install Kiro CLI (`kiro-cli`) or check %LOCALAPPDATA%\Kiro-Cli\kiro-cli.exe"
+            }
             AgentProviderKind::Claude => "npm install -g @anthropic-ai/claude-code",
             AgentProviderKind::Codex => "npm install -g @openai/codex",
             AgentProviderKind::OpenCode => "npm install -g opencode-ai",
@@ -265,6 +280,38 @@ impl AgentProvider {
             }
         }
     }
+
+    /// Adapts invocation arguments when the resolved OS binary uses a newer or alternate
+    /// CLI entry point (for example `kiro-cli.exe` v3 or `agy.EXE`).
+    pub fn adapt_args_for_resolved_binary(
+        &self,
+        resolved_program: &Path,
+        input: &InvocationInput<'_>,
+    ) -> Option<Vec<String>> {
+        let stem = resolved_program
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase());
+
+        match (self, stem.as_deref()) {
+            (AgentProvider::Kiro, Some("kiro-cli")) => Some(vec![
+                "chat".to_string(),
+                "--no-interactive".to_string(),
+                "--trust-workspace".to_string(),
+                "--trust-tools=fs_read,web_search,web_fetch".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                input.prompt.to_string(),
+            ]),
+            (AgentProvider::Antigravity, Some("agy")) => Some(vec![
+                "-p".to_string(),
+                input.prompt.to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ]),
+            _ => None,
+        }
+    }
 }
 
 /// A locally discovered built-in Agent CLI binary.
@@ -317,7 +364,13 @@ pub fn discover_providers_in(
     AgentProviderKind::all_builtin()
         .into_iter()
         .map(|kind| {
-            let mut resolved = resolve_binary_in_dirs(kind.default_command(), path_dirs, path_exts);
+            let mut resolved = None;
+            for alias in kind.command_aliases() {
+                resolved = resolve_binary_in_dirs(alias, path_dirs, path_exts);
+                if resolved.is_some() {
+                    break;
+                }
+            }
             if resolved.is_none() {
                 if let Some((_, candidates)) = extra_candidates.iter().find(|(k, _)| *k == kind) {
                     resolved = candidates
@@ -327,10 +380,17 @@ pub fn discover_providers_in(
                 }
             }
 
+            let command = resolved
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_else(|| kind.default_command().to_string());
+
             ProviderStatus {
                 kind,
                 display_name: kind.display_name().to_string(),
-                command: kind.default_command().to_string(),
+                command,
                 available: resolved.is_some(),
                 resolved_path: resolved,
                 install_hint: kind.install_hint().to_string(),
@@ -450,6 +510,11 @@ pub fn default_search_dirs_and_exts() -> SearchDirsAndExts {
         push_dir(home.join(".local").join("bin"));
         push_dir(home.join(".cargo").join("bin"));
     }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let local = PathBuf::from(&local_app_data);
+        push_dir(local.join("Kiro-Cli"));
+        push_dir(local.join("agy").join("bin"));
+    }
 
     let mut exts = Vec::new();
     let mut seen_exts = HashSet::new();
@@ -472,10 +537,13 @@ pub fn default_search_dirs_and_exts() -> SearchDirsAndExts {
 
     let mut extra = Vec::new();
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let programs = PathBuf::from(local_app_data).join("Programs");
+        let local = PathBuf::from(&local_app_data);
+        let programs = local.join("Programs");
         extra.push((
             AgentProviderKind::Antigravity,
             vec![
+                local.join("agy").join("bin").join("agy.exe"),
+                local.join("agy").join("bin").join("agy.EXE"),
                 programs.join("Antigravity").join("bin").join("antigravity.exe"),
                 programs.join("Antigravity").join("antigravity.exe"),
                 programs.join("Google").join("Antigravity").join("antigravity.exe"),
@@ -484,9 +552,9 @@ pub fn default_search_dirs_and_exts() -> SearchDirsAndExts {
         extra.push((
             AgentProviderKind::Kiro,
             vec![
+                local.join("Kiro-Cli").join("kiro-cli.exe"),
+                programs.join("Kiro").join("bin").join("kiro-cli.exe"),
                 programs.join("Kiro").join("bin").join("kiro.exe"),
-                programs.join("Kiro").join("Kiro.exe"),
-                programs.join("Kiro").join("kiro.exe"),
             ],
         ));
         extra.push((
@@ -702,5 +770,77 @@ mod tests {
         let _ = discover_available_providers();
         let all = discover_all_provider_statuses();
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn discovers_kiro_cli_and_agy_aliases_and_adapts_args() {
+        let dir = unique_temp_dir("aliases");
+        let kiro_cli_exe = dir.join("kiro-cli.exe");
+        let agy_exe = dir.join("agy.EXE");
+        fs::write(&kiro_cli_exe, b"stub").unwrap();
+        fs::write(&agy_exe, b"stub").unwrap();
+
+        let exts = vec![".EXE".to_string(), ".CMD".to_string()];
+        let statuses = discover_providers_in(std::slice::from_ref(&dir), &[], &exts);
+
+        let kiro_status = statuses
+            .iter()
+            .find(|s| s.kind == AgentProviderKind::Kiro)
+            .expect("kiro status");
+        assert!(kiro_status.available);
+        assert_eq!(kiro_status.command, "kiro-cli");
+        assert_eq!(kiro_status.resolved_path.as_ref(), Some(&kiro_cli_exe));
+
+        let agy_status = statuses
+            .iter()
+            .find(|s| s.kind == AgentProviderKind::Antigravity)
+            .expect("antigravity status");
+        assert!(agy_status.available);
+        assert_eq!(agy_status.command, "agy");
+        assert_eq!(agy_status.resolved_path.as_ref(), Some(&agy_exe));
+
+        let input = InvocationInput {
+            prompt: "Should I delete C:\\Windows\\Temp?",
+            context_json: "{}",
+            prompt_file_path: None,
+        };
+        let adapted_kiro = AgentProvider::Kiro
+            .adapt_args_for_resolved_binary(&kiro_cli_exe, &input)
+            .expect("adapted kiro-cli args");
+        assert_eq!(
+            adapted_kiro,
+            vec![
+                "chat",
+                "--no-interactive",
+                "--trust-workspace",
+                "--trust-tools=fs_read,web_search,web_fetch",
+                "--output-format",
+                "stream-json",
+                "Should I delete C:\\Windows\\Temp?",
+            ]
+        );
+
+        let adapted_agy = AgentProvider::Antigravity
+            .adapt_args_for_resolved_binary(&agy_exe, &input)
+            .expect("adapted agy args");
+        assert_eq!(
+            adapted_agy,
+            vec![
+                "-p",
+                "Should I delete C:\\Windows\\Temp?",
+                "--output-format",
+                "json",
+            ]
+        );
+
+        // Legacy names keep build_command_spec args unchanged.
+        assert!(AgentProvider::Kiro
+            .adapt_args_for_resolved_binary(Path::new("kiro.exe"), &input)
+            .is_none());
+        assert!(AgentProvider::Antigravity
+            .adapt_args_for_resolved_binary(Path::new("antigravity.exe"), &input)
+            .is_none());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

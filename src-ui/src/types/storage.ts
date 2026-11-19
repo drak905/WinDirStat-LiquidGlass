@@ -69,6 +69,8 @@ export interface AgentProviderStatus {
   available: boolean;
   command: string;
   latencyMs?: number;
+  resolvedPath?: string | null;
+  installHint?: string;
 }
 
 export type AgentVerdict =
@@ -98,6 +100,14 @@ export interface AgentAdvisorResponse {
   rationale: string;
   sources: AgentSourceReference[];
   createdAt: string;
+  userPrompt?: string;
+  responseMode?: 'verdict' | 'chat' | 'error';
+  assistantReply?: string;
+  isLiveCli?: boolean;
+  resolvedCommand?: string;
+  durationMs?: number;
+  error?: string;
+  installHint?: string;
 }
 
 export interface VaultItem {
@@ -130,6 +140,15 @@ export interface AskAgentAdvisorParams {
   targetName?: string;
   targetSizeBytes?: number;
   customCommand?: string;
+  activeDrive?: string;
+}
+
+export interface AgentCliTestResult {
+  ok: boolean;
+  command?: string;
+  output?: string;
+  error?: string;
+  durationMs?: number;
 }
 
 export interface QuarantineItemParams {
@@ -145,6 +164,7 @@ export interface WdsBridge {
   findDuplicates(target: string): Promise<DuplicateGroup[]>;
   detectAgentClis(): Promise<AgentProviderStatus[]>;
   askAgentAdvisor(params: AskAgentAdvisorParams): Promise<AgentAdvisorResponse>;
+  testAgentCli?(provider: AgentProvider, customCommand?: string): Promise<AgentCliTestResult>;
   quarantineItem(params: QuarantineItemParams): Promise<VaultItem>;
   listVaultItems(): Promise<VaultItem[]>;
   rollbackVaultItem(id: string): Promise<VaultItem>;

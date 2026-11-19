@@ -130,14 +130,40 @@ export function App() {
       setIsStreamingAdvice(true);
       try {
         const bridge = getBridge();
-        const response = await bridge.askAgentAdvisor(params);
+        const response = await bridge.askAgentAdvisor({
+          ...params,
+          activeDrive: selectedDrive,
+        });
         setAdvisorResponses((prev) => [response, ...prev]);
         return response;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const errResponse: AgentAdvisorResponse = {
+          id: `adv-err-${Date.now()}`,
+          targetPath: params.targetPath ?? selectedDrive ?? 'General Storage Inquiry',
+          targetName: params.targetName ?? 'Agent CLI Error',
+          targetSizeBytes: params.targetSizeBytes ?? 0,
+          provider: params.provider,
+          verdict: 'REVIEW_CAREFULLY',
+          risk_score: 0,
+          reclaimable_bytes: 0,
+          usage_value_assessment: msg,
+          rationale: msg,
+          sources: [],
+          createdAt: new Date().toISOString(),
+          userPrompt: params.prompt,
+          responseMode: 'error',
+          isLiveCli: false,
+          error: msg,
+        };
+        setAdvisorResponses((prev) => [errResponse, ...prev]);
+        showToast(`Agent CLI error: ${msg}`);
+        return errResponse;
       } finally {
         setIsStreamingAdvice(false);
       }
     },
-    []
+    [selectedDrive, showToast]
   );
 
   const handleQuarantine = useCallback(
@@ -260,6 +286,10 @@ export function App() {
               responses={advisorResponses}
               isStreaming={isStreamingAdvice}
               onSendPrompt={handleAskAgent}
+              onRefreshProviders={async () => {
+                const detected = await getBridge().detectAgentClis();
+                setProviders(detected);
+              }}
               onQuarantineRecommended={(resp) =>
                 handleQuarantine({
                   path: resp.targetPath,

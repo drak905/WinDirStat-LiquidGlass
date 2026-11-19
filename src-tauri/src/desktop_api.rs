@@ -10,11 +10,17 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::agent_hub::context::{LockedHandleStatus, StorageContextPayload};
+use crate::agent_hub::prompt::build_cross_check_system_prompt;
 use crate::agent_hub::providers::{
     discover_all_provider_statuses, AgentProvider, AgentProviderKind, CustomCliConfig,
 };
-use crate::agent_hub::runner::{AgentHubRunner, DefaultCommandResolver, RunnerConfig};
-use crate::agent_hub::validator::AdvisorVerdict;
+use crate::agent_hub::runner::{
+    AgentHubError, AgentHubRunner, DefaultCommandResolver, RunnerConfig,
+};
+use crate::agent_hub::validator::{
+    extract_assistant_text, extract_external_urls_from_text, parse_and_validate_advisor_response,
+    AdvisorVerdict,
+};
 use crate::ipc_bridge::snapshot_bridge::{compute_file_xxhash64, group_duplicates_by_xxhash64};
 use crate::ipc_bridge::ScanNode;
 use crate::vault::schema::VaultItemStatus;
@@ -105,6 +111,9 @@ pub struct UiAgentProviderStatus {
     pub available: bool,
     pub command: String,
     pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
+    pub install_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -516,6 +525,8 @@ pub fn detect_ui_providers() -> Vec<UiAgentProviderStatus> {
             available: st.available,
             command: st.command,
             latency_ms: if st.available { 45 } else { 0 },
+            resolved_path: st.resolved_path.map(|p| p.to_string_lossy().into_owned()),
+            install_hint: st.install_hint,
         })
         .collect();
     statuses.push(UiAgentProviderStatus {
@@ -524,6 +535,8 @@ pub fn detect_ui_providers() -> Vec<UiAgentProviderStatus> {
         available: true,
         command: "custom-agent".to_string(),
         latency_ms: 50,
+        resolved_path: None,
+        install_hint: AgentProviderKind::Custom.install_hint().to_string(),
     });
     statuses
 }
@@ -552,98 +565,491 @@ fn parse_provider(name: &str, custom_command: Option<&str>) -> Option<AgentProvi
     }
 }
 
-pub fn try_run_real_advisor(
+/// Extracts a Windows drive path (`C:\...`, `"D:\My Dir\file.iso"`, etc.) from free-form prompt text.
+pub fn extract_windows_path_from_prompt(prompt: &str) -> Option<String> {
+    let bytes = prompt.as_bytes();
+    let mut i = 0;
+
+    while i + 2 < bytes.len() {
+        let ch = bytes[i];
+        // Check quoted path first: `"C:\..."` or `'C:\...'`
+        if (ch == b'"' || ch == b'\'') && i + 3 < bytes.len() {
+            let drive = bytes[i + 1];
+            let colon = bytes[i + 2];
+            let sep = bytes[i + 3];
+            if drive.is_ascii_alphabetic() && colon == b':' && (sep == b'\\' || sep == b'/') {
+                let start = i + 1;
+                if let Some(close_rel) = prompt[start..].find(ch as char) {
+                    let candidate = prompt[start..start + close_rel].trim();
+                    if candidate.len() >= 3 {
+                        return Some(candidate.to_string());
+                    }
+                }
+            }
+        }
+
+        // Check unquoted path boundary (`C:\...` or `C:/...`)
+        let prev_ok = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+        if prev_ok
+            && ch.is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/')
+        {
+            let rest = &prompt[i..];
+            let end_rel = rest
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+                .unwrap_or(rest.len());
+            let candidate = rest[..end_rel]
+                .trim_end_matches(&['?', ',', '.', ';', ')', ']', '`'][..]);
+            if candidate.len() >= 3 {
+                return Some(candidate.to_string());
+            }
+        }
+
+        i += prompt[i..].chars().next().map_or(1, char::len_utf8);
+    }
+
+    None
+}
+
+fn provider_display_label(provider_str: &str) -> &'static str {
+    match provider_str {
+        "antigravity" => "Antigravity CLI",
+        "kiro" => "Kiro CLI",
+        "claude" => "Claude Code CLI",
+        "codex" => "OpenAI Codex CLI",
+        "opencode" => "OpenCode CLI",
+        "custom" => "Custom CLI",
+        _ => "Agent CLI",
+    }
+}
+
+fn truncate_snippet(raw: &str, max_chars: usize) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let total = collapsed.chars().count();
+    if total <= max_chars {
+        collapsed
+    } else {
+        let prefix: String = collapsed.chars().take(max_chars).collect();
+        format!("{prefix}...")
+    }
+}
+
+fn format_friendly_cli_error(provider_str: &str, err: &AgentHubError) -> String {
+    let label = provider_display_label(provider_str);
+    match err {
+        AgentHubError::BinaryNotFound { program } => {
+            format!("{label} executable (`{program}`) was not found on PATH or standard install locations.")
+        }
+        AgentHubError::Timeout { timeout_ms, .. } => {
+            let secs = timeout_ms / 1000;
+            format!(
+                "{label} timed out after {secs}s. Try asking a more specific question or verify your CLI connection."
+            )
+        }
+        AgentHubError::ProcessFailed {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        } => {
+            let combined = format!("{stderr}\n{stdout}");
+            let lower = combined.to_ascii_lowercase();
+            let auth_hint = if lower.contains("login")
+                || lower.contains("unauthorized")
+                || lower.contains("expired")
+                || lower.contains("credentials")
+                || lower.contains("authenticate")
+                || lower.contains("sso")
+            {
+                if provider_str == "kiro" {
+                    " Your Kiro session may need sign-in — run `kiro-cli login` in a terminal."
+                } else {
+                    " Your CLI session may require authentication."
+                }
+            } else {
+                ""
+            };
+            let detail_src = if !stderr.trim().is_empty() {
+                stderr.as_str()
+            } else {
+                stdout.as_str()
+            };
+            let detail = truncate_snippet(detail_src, 320);
+            if detail.is_empty() {
+                format!("{label} exited with status {exit_code:?}.{auth_hint}")
+            } else {
+                format!("{label} exited with status {exit_code:?}: {detail}{auth_hint}")
+            }
+        }
+        other => format!("{label} failed: {other}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_error_response(
+    provider_str: &str,
+    prompt: &str,
+    target_path: &str,
+    target_name: &str,
+    target_size_bytes: u64,
+    error: String,
+    install_hint: Option<String>,
+    resolved_command: Option<String>,
+) -> Value {
+    json!({
+        "id": format!("adv-{}", Utc::now().timestamp_millis()),
+        "targetPath": target_path,
+        "targetName": target_name,
+        "targetSizeBytes": target_size_bytes,
+        "provider": provider_str,
+        "verdict": "REVIEW_CAREFULLY",
+        "risk_score": 0,
+        "reclaimable_bytes": 0,
+        "usage_value_assessment": error,
+        "rationale": error,
+        "sources": [],
+        "createdAt": Utc::now().to_rfc3339(),
+        "userPrompt": prompt,
+        "responseMode": "error",
+        "isLiveCli": false,
+        "resolvedCommand": resolved_command,
+        "error": error,
+        "installHint": install_hint,
+    })
+}
+
+pub async fn run_real_advisor_async(
     provider_str: &str,
     prompt: &str,
     target_path: Option<&str>,
     target_name: Option<&str>,
     target_size_bytes: Option<u64>,
     custom_command: Option<&str>,
-) -> Option<Value> {
-    let target_path = target_path.unwrap_or("");
-    if target_path.is_empty() || !Path::new(target_path).exists() {
-        return None;
+    active_drive: Option<&str>,
+) -> Value {
+    let trimmed_prompt = prompt.trim();
+    let explicit_target = target_path.map(str::trim).filter(|s| !s.is_empty());
+    let extracted_path = if explicit_target.is_none() {
+        extract_windows_path_from_prompt(trimmed_prompt)
+    } else {
+        None
+    };
+    let concrete_path = explicit_target
+        .map(ToString::to_string)
+        .or(extracted_path);
+
+    let clean_active_drive = active_drive
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.starts_with("demo://"))
+        .map(ToString::to_string);
+
+    let resolved_target_path = concrete_path
+        .clone()
+        .or_else(|| clean_active_drive.clone())
+        .unwrap_or_else(|| "General Storage Inquiry".to_string());
+
+    let resolved_size_bytes = target_size_bytes.unwrap_or_else(|| {
+        concrete_path
+            .as_deref()
+            .and_then(|p| fs::metadata(p).ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    });
+
+    let resolved_name = target_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            Path::new(&resolved_target_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(&resolved_target_path)
+                .to_string()
+        });
+
+    if trimmed_prompt.is_empty() {
+        return make_error_response(
+            provider_str,
+            prompt,
+            &resolved_target_path,
+            &resolved_name,
+            resolved_size_bytes,
+            "Please enter a question or path for the Agent CLI.".to_string(),
+            None,
+            None,
+        );
     }
 
-    let provider = parse_provider(provider_str, custom_command)?;
+    let Some(provider) = parse_provider(provider_str, custom_command) else {
+        let (msg, hint) = if provider_str == "custom" {
+            (
+                "Custom CLI command is empty or invalid. Enter an executable path in the Custom CLI field.".to_string(),
+                Some(AgentProviderKind::Custom.install_hint().to_string()),
+            )
+        } else {
+            (
+                format!("Unsupported Agent CLI provider `{provider_str}`."),
+                None,
+            )
+        };
+        return make_error_response(
+            provider_str,
+            trimmed_prompt,
+            &resolved_target_path,
+            &resolved_name,
+            resolved_size_bytes,
+            msg,
+            hint,
+            None,
+        );
+    };
+
+    let statuses = discover_all_provider_statuses();
+    let matched_status = statuses
+        .iter()
+        .find(|s| map_provider_id(s.kind) == provider_str);
+
     if !matches!(provider, AgentProvider::Custom(_)) {
-        let available = discover_all_provider_statuses()
-            .into_iter()
-            .any(|s| map_provider_id(s.kind) == provider_str && s.available);
-        if !available {
-            return None;
+        if let Some(st) = matched_status {
+            if !st.available {
+                return make_error_response(
+                    provider_str,
+                    trimmed_prompt,
+                    &resolved_target_path,
+                    &resolved_name,
+                    resolved_size_bytes,
+                    format!(
+                        "{} was not found on PATH or standard install directories on this PC.",
+                        st.display_name
+                    ),
+                    Some(st.install_hint.clone()),
+                    Some(st.command.clone()),
+                );
+            }
         }
     }
 
-    let size_bytes = target_size_bytes.unwrap_or(0);
-    let resolved_name = target_name
-        .map(ToString::to_string)
-        .unwrap_or_else(|| target_path.to_string());
+    let install_hint = matched_status
+        .map(|s| s.install_hint.clone())
+        .or_else(|| Some(AgentProviderKind::Custom.install_hint().to_string()));
+    let default_cmd_label = matched_status
+        .map(|s| s.command.clone())
+        .unwrap_or_else(|| provider.default_binary_name().to_string());
+
+    let prompt_lower = trimmed_prompt.to_ascii_lowercase();
+    let mentions_storage_file = [
+        ".vhdx",
+        ".iso",
+        ".tmp",
+        ".log",
+        ".dll",
+        ".exe",
+        ".msi",
+        ".msp",
+        "node_modules",
+        "system32",
+        "appdata",
+        "winsxs",
+    ]
+    .iter()
+    .any(|kw| prompt_lower.contains(kw));
+    let is_targeted_inspection =
+        explicit_target.is_some() || concrete_path.is_some() || mentions_storage_file;
 
     let payload = StorageContextPayload {
-        path: target_path.to_string(),
-        logical_size_bytes: size_bytes,
-        physical_size_bytes: size_bytes,
+        path: resolved_target_path.clone(),
+        logical_size_bytes: resolved_size_bytes,
+        physical_size_bytes: resolved_size_bytes,
         file_count: 1,
-        oldest_modified_utc: Some(Utc::now().to_rfc3339()),
-        newest_modified_utc: Some(Utc::now().to_rfc3339()),
+        oldest_modified_utc: None,
+        newest_modified_utc: None,
         publisher_signature: None,
         top_extensions: Vec::new(),
-        locked_handle_status: LockedHandleStatus::Unlocked,
-        user_question: prompt.to_string(),
+        locked_handle_status: LockedHandleStatus::Unknown,
+        user_question: trimmed_prompt.to_string(),
     };
 
-    let rt = tokio::runtime::Runtime::new().ok()?;
+    let context_json = payload.to_compact_json().unwrap_or_else(|_| "{}".to_string());
+    let prompt_to_send = if is_targeted_inspection {
+        build_cross_check_system_prompt(&payload)
+    } else {
+        format!(
+            "You are the WinDirStat Storage Intelligence Advisor inside WinDirStat Liquid Glass.\n\
+             Active drive context: {active}\n\
+             Answer the user's question directly and concisely in plain text or Markdown.\n\
+             Include verified public documentation URLs (https://...) where helpful, and recommend using the 7-Day Quarantine Vault rather than permanent deletion when discussing file removal.\n\
+             If the user asks whether a specific file or directory path is safe to delete or keep, include a ```json``` block conforming to fields: verdict (SAFE_TO_DELETE|SAFE_WITH_APP_CLOSED|CLEAN_VIA_OFFICIAL_TOOL|KEEP_CRITICAL), risk_score (0-100), reclaimable_bytes, usage_value_assessment, cross_checked_sources (>=3 objects with title, url, source_type, finding), recommended_action.\n\n\
+             User Question:\n{question}",
+            active = clean_active_drive.as_deref().unwrap_or("None"),
+            question = trimmed_prompt,
+        )
+    };
+
     let runner = AgentHubRunner::with_resolver(
         Arc::new(DefaultCommandResolver),
         RunnerConfig {
-            timeout: Duration::from_secs(30),
-            ..RunnerConfig::default()
+            timeout: Duration::from_secs(120),
+            self_test_timeout: Duration::from_secs(15),
         },
     );
-    let outcome = rt
-        .block_on(runner.run_advisor(&provider, &payload, None))
-        .ok()?;
-    let verdict = match outcome.response.verdict {
-        AdvisorVerdict::SafeToDelete => "SAFE_TO_DELETE",
-        AdvisorVerdict::CleanViaOfficialTool => "QUARANTINE_RECOMMENDED",
-        AdvisorVerdict::SafeWithAppClosed => "REVIEW_CAREFULLY",
-        AdvisorVerdict::KeepCritical => "KEEP",
+
+    let raw = match runner
+        .run_raw_prompt(&provider, &prompt_to_send, &context_json, None)
+        .await
+    {
+        Ok(out) => out,
+        Err(err) => {
+            return make_error_response(
+                provider_str,
+                trimmed_prompt,
+                &resolved_target_path,
+                &resolved_name,
+                resolved_size_bytes,
+                format_friendly_cli_error(provider_str, &err),
+                install_hint,
+                Some(default_cmd_label),
+            );
+        }
     };
 
-    let sources: Vec<Value> = outcome
-        .response
-        .cross_checked_sources
-        .into_iter()
-        .map(|s| {
-            let domain = url::Url::parse(&s.url)
-                .ok()
-                .and_then(|u| u.host_str().map(ToString::to_string))
-                .unwrap_or_default();
-            json!({
-                "title": s.title,
-                "url": s.url,
-                "domain": domain,
-                "verified": true,
-                "snippet": s.finding,
-            })
-        })
-        .collect();
+    let invoked_cmd = raw
+        .invoked_program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(ToString::to_string)
+        .unwrap_or(default_cmd_label);
 
-    Some(json!({
-        "id": format!("adv-{}", Utc::now().timestamp_millis()),
-        "targetPath": target_path,
-        "targetName": resolved_name,
-        "targetSizeBytes": size_bytes,
-        "provider": provider_str,
-        "verdict": verdict,
-        "risk_score": outcome.response.risk_score,
-        "reclaimable_bytes": outcome.response.reclaimable_bytes,
-        "usage_value_assessment": outcome.response.usage_value_assessment,
-        "rationale": outcome.response.recommended_action,
-        "sources": sources,
-        "createdAt": Utc::now().to_rfc3339(),
-    }))
+    if let Ok(parsed) = parse_and_validate_advisor_response(&raw.stdout) {
+        let verdict = match parsed.verdict {
+            AdvisorVerdict::SafeToDelete => "SAFE_TO_DELETE",
+            AdvisorVerdict::CleanViaOfficialTool => "QUARANTINE_RECOMMENDED",
+            AdvisorVerdict::SafeWithAppClosed => "REVIEW_CAREFULLY",
+            AdvisorVerdict::KeepCritical => "KEEP",
+        };
+        let sources: Vec<Value> = parsed
+            .cross_checked_sources
+            .into_iter()
+            .map(|s| {
+                let domain = url::Url::parse(&s.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(ToString::to_string))
+                    .unwrap_or_default();
+                json!({
+                    "title": s.title,
+                    "url": s.url,
+                    "domain": domain,
+                    "verified": true,
+                    "snippet": s.finding,
+                })
+            })
+            .collect();
+
+        return json!({
+            "id": format!("adv-{}", Utc::now().timestamp_millis()),
+            "targetPath": resolved_target_path,
+            "targetName": resolved_name,
+            "targetSizeBytes": resolved_size_bytes,
+            "provider": provider_str,
+            "verdict": verdict,
+            "risk_score": parsed.risk_score,
+            "reclaimable_bytes": parsed.reclaimable_bytes,
+            "usage_value_assessment": parsed.usage_value_assessment,
+            "rationale": parsed.recommended_action,
+            "sources": sources,
+            "createdAt": Utc::now().to_rfc3339(),
+            "userPrompt": trimmed_prompt,
+            "responseMode": "verdict",
+            "isLiveCli": true,
+            "resolvedCommand": invoked_cmd,
+            "durationMs": raw.duration_ms as u64,
+        });
+    }
+
+    if let Some(reply_text) = extract_assistant_text(&raw.stdout) {
+        if !reply_text.trim().is_empty() {
+            let sources: Vec<Value> = extract_external_urls_from_text(&reply_text)
+                .into_iter()
+                .map(|(url, domain)| {
+                    json!({
+                        "title": domain,
+                        "url": url,
+                        "domain": domain,
+                        "verified": true,
+                        "snippet": format!("Referenced in {invoked_cmd} response"),
+                    })
+                })
+                .collect();
+
+            return json!({
+                "id": format!("adv-{}", Utc::now().timestamp_millis()),
+                "targetPath": resolved_target_path,
+                "targetName": resolved_name,
+                "targetSizeBytes": resolved_size_bytes,
+                "provider": provider_str,
+                "verdict": "REVIEW_CAREFULLY",
+                "risk_score": 0,
+                "reclaimable_bytes": 0,
+                "usage_value_assessment": reply_text,
+                "rationale": format!(
+                    "Live reply from {} ({:.1}s)",
+                    invoked_cmd,
+                    (raw.duration_ms as f64) / 1000.0
+                ),
+                "sources": sources,
+                "createdAt": Utc::now().to_rfc3339(),
+                "userPrompt": trimmed_prompt,
+                "responseMode": "chat",
+                "assistantReply": reply_text,
+                "isLiveCli": true,
+                "resolvedCommand": invoked_cmd,
+                "durationMs": raw.duration_ms as u64,
+            });
+        }
+    }
+
+    let stderr_snippet = truncate_snippet(&raw.stderr, 260);
+    let empty_err = if stderr_snippet.is_empty() {
+        format!("{invoked_cmd} exited cleanly but produced no readable assistant reply.")
+    } else {
+        format!("{invoked_cmd} produced no readable assistant reply ({stderr_snippet}).")
+    };
+    make_error_response(
+        provider_str,
+        trimmed_prompt,
+        &resolved_target_path,
+        &resolved_name,
+        resolved_size_bytes,
+        empty_err,
+        install_hint,
+        Some(invoked_cmd),
+    )
+}
+
+pub async fn test_agent_cli_async(provider_str: &str, custom_command: Option<&str>) -> Value {
+    let Some(provider) = parse_provider(provider_str, custom_command) else {
+        return json!({
+            "ok": false,
+            "error": format!("Unsupported or unconfigured provider `{provider_str}`."),
+        });
+    };
+
+    let runner = AgentHubRunner::default();
+    match runner.self_test_provider(&provider).await {
+        Ok(report) => json!({
+            "ok": report.ok,
+            "command": report.resolved_program.to_string_lossy(),
+            "output": report.stdout.trim(),
+            "durationMs": report.duration_ms as u64,
+        }),
+        Err(err) => json!({
+            "ok": false,
+            "error": err.to_string(),
+        }),
+    }
 }
 
 pub fn map_vault_record(
@@ -719,4 +1125,84 @@ pub fn rollback_real_vault_item(ctx: &AppContext, id: &str) -> Option<UiVaultIte
     let svc = ctx.open_vault().ok()?;
     svc.rollback_item(id).ok()?;
     svc.get_item(id).ok().flatten().map(map_vault_record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_quoted_and_unquoted_windows_paths_from_prompts() {
+        assert_eq!(
+            extract_windows_path_from_prompt(
+                r"Should I delete C:\Windows\Temp\installer-cache-bundle.tmp?"
+            ),
+            Some(r"C:\Windows\Temp\installer-cache-bundle.tmp".to_string())
+        );
+        assert_eq!(
+            extract_windows_path_from_prompt(
+                r#"Inspect "E:\My Backups\ubuntu-24.04.1-desktop-amd64.iso" please."#
+            ),
+            Some(r"E:\My Backups\ubuntu-24.04.1-desktop-amd64.iso".to_string())
+        );
+        assert_eq!(
+            extract_windows_path_from_prompt(r"What is taking space in C:\Windows\Temp."),
+            Some(r"C:\Windows\Temp".to_string())
+        );
+        assert_eq!(
+            extract_windows_path_from_prompt("Hello Kiro, how does the 7-day vault work?"),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_ui_providers_returns_all_six_entries_with_install_hints() {
+        let providers = detect_ui_providers();
+        assert_eq!(providers.len(), 6);
+        for id in ["antigravity", "kiro", "claude", "codex", "opencode", "custom"] {
+            let entry = providers
+                .iter()
+                .find(|p| p.provider == id)
+                .unwrap_or_else(|| panic!("missing provider {id}"));
+            assert!(!entry.install_hint.trim().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Invokes live local kiro-cli process with network access"]
+    async fn live_kiro_cli_smoke() {
+        let chat_res = run_real_advisor_async(
+            "kiro",
+            "Reply with one short sentence saying hello from Kiro CLI.",
+            None,
+            None,
+            None,
+            None,
+            Some("C:\\"),
+        )
+        .await;
+        println!("LIVE CHAT: {chat_res}");
+        assert_eq!(chat_res["isLiveCli"], json!(true));
+        assert!(
+            matches!(chat_res["responseMode"].as_str(), Some("chat" | "verdict")),
+            "unexpected chat response: {chat_res}"
+        );
+
+        let inspect_res = run_real_advisor_async(
+            "kiro",
+            "Should I delete C:\\Windows\\Temp?",
+            None,
+            None,
+            None,
+            None,
+            Some("C:\\"),
+        )
+        .await;
+        println!("LIVE INSPECT: {inspect_res}");
+        assert_eq!(inspect_res["isLiveCli"], json!(true));
+        assert!(
+            matches!(inspect_res["responseMode"].as_str(), Some("chat" | "verdict")),
+            "unexpected inspect response: {inspect_res}"
+        );
+    }
 }
