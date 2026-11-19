@@ -1,38 +1,24 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 
-use windirstat_liquid_glass::agent_hub::context::{LockedHandleStatus, StorageContextPayload};
-use windirstat_liquid_glass::agent_hub::providers::{
+use crate::agent_hub::context::{LockedHandleStatus, StorageContextPayload};
+use crate::agent_hub::providers::{
     discover_all_provider_statuses, AgentProvider, AgentProviderKind, CustomCliConfig,
 };
-use windirstat_liquid_glass::agent_hub::runner::{
-    AgentHubRunner, DefaultCommandResolver, RunnerConfig,
-};
-use windirstat_liquid_glass::agent_hub::validator::AdvisorVerdict;
-use windirstat_liquid_glass::ipc_bridge::snapshot_bridge::{
-    compute_file_xxhash64, group_duplicates_by_xxhash64,
-};
-use windirstat_liquid_glass::ipc_bridge::ScanNode;
-use windirstat_liquid_glass::vault::schema::VaultItemStatus;
-use windirstat_liquid_glass::vault::service::start_expiration_worker;
-use windirstat_liquid_glass::vault::{VaultConfig, VaultService};
-
-include!(concat!(env!("OUT_DIR"), "/embedded_ui_assets.rs"));
+use crate::agent_hub::runner::{AgentHubRunner, DefaultCommandResolver, RunnerConfig};
+use crate::agent_hub::validator::AdvisorVerdict;
+use crate::ipc_bridge::snapshot_bridge::{compute_file_xxhash64, group_duplicates_by_xxhash64};
+use crate::ipc_bridge::ScanNode;
+use crate::vault::schema::VaultItemStatus;
+use crate::vault::{VaultConfig, VaultService};
 
 const MAX_SCAN_NODES: usize = 18_000;
 const MAX_SCAN_DEPTH: usize = 6;
@@ -40,117 +26,110 @@ const MAX_SCAN_MILLIS: u128 = 4_500;
 const MAX_DUP_FILES: usize = 8_000;
 const MAX_DUP_HASH_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
-struct InvokeRequest {
-    command: String,
-    #[serde(default)]
-    args: Value,
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiDriveInfo {
+    pub id: String,
+    pub label: String,
+    pub mount_point: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub kind: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiDriveInfo {
-    id: String,
-    label: String,
-    mount_point: String,
-    total_bytes: u64,
-    used_bytes: u64,
-    free_bytes: u64,
-    kind: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UiStorageNode {
-    id: String,
-    name: String,
-    path: String,
-    size: u64,
-    is_dir: bool,
+pub struct UiStorageNode {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    extension: Option<String>,
-    file_count: usize,
+    pub extension: Option<String>,
+    pub file_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    modified_at: Option<String>,
+    pub modified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    children: Option<Vec<UiStorageNode>>,
+    pub children: Option<Vec<UiStorageNode>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiExtensionSummary {
-    extension: String,
-    color: String,
-    total_bytes: u64,
-    file_count: usize,
-    percent: f64,
-    sample_path: String,
+pub struct UiExtensionSummary {
+    pub extension: String,
+    pub color: String,
+    pub total_bytes: u64,
+    pub file_count: usize,
+    pub percent: f64,
+    pub sample_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiScanSnapshot {
-    drive_id: String,
-    root: UiStorageNode,
-    total_nodes: usize,
-    scan_duration_ms: u64,
-    extensions: Vec<UiExtensionSummary>,
+pub struct UiScanSnapshot {
+    pub drive_id: String,
+    pub root: UiStorageNode,
+    pub total_nodes: usize,
+    pub scan_duration_ms: u64,
+    pub extensions: Vec<UiExtensionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiDuplicateFileEntry {
-    id: String,
-    name: String,
-    path: String,
-    modified_at: String,
+pub struct UiDuplicateFileEntry {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub modified_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiDuplicateGroup {
-    id: String,
-    hash: String,
-    hash_algorithm: &'static str,
-    file_size: u64,
-    wasted_bytes: u64,
-    extension: String,
-    files: Vec<UiDuplicateFileEntry>,
+pub struct UiDuplicateGroup {
+    pub id: String,
+    pub hash: String,
+    pub hash_algorithm: &'static str,
+    pub file_size: u64,
+    pub wasted_bytes: u64,
+    pub extension: String,
+    pub files: Vec<UiDuplicateFileEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiAgentProviderStatus {
-    provider: &'static str,
-    display_name: String,
-    available: bool,
-    command: String,
-    latency_ms: u64,
+pub struct UiAgentProviderStatus {
+    pub provider: &'static str,
+    pub display_name: String,
+    pub available: bool,
+    pub command: String,
+    pub latency_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UiVaultItem {
-    id: String,
-    batch_id: String,
-    original_path: String,
-    file_name: String,
-    size_bytes: u64,
-    quarantined_at: String,
-    expires_at: String,
-    remaining_hours: f64,
-    sha256: String,
-    xxhash64: String,
-    hash_verified: bool,
-    status: &'static str,
+pub struct UiVaultItem {
+    pub id: String,
+    pub batch_id: String,
+    pub original_path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub quarantined_at: String,
+    pub expires_at: String,
+    pub remaining_hours: f64,
+    pub sha256: String,
+    pub xxhash64: String,
+    pub hash_verified: bool,
+    pub status: &'static str,
 }
 
-struct AppContext {
-    vault_db_path: PathBuf,
+pub struct AppContext {
+    pub vault_db_path: PathBuf,
 }
 
 impl AppContext {
-    fn open_vault(&self) -> Result<VaultService, String> {
+    pub fn open_vault(&self) -> Result<VaultService, String> {
         VaultService::new(VaultConfig {
             manifest_db_path: self.vault_db_path.clone(),
             vault_root_override: None,
@@ -160,7 +139,7 @@ impl AppContext {
     }
 }
 
-fn default_app_data_dir() -> PathBuf {
+pub fn default_app_data_dir() -> PathBuf {
     if let Some(local) = env::var_os("LOCALAPPDATA") {
         if !local.is_empty() {
             return PathBuf::from(local).join("WinDirStatLiquidGlass");
@@ -170,7 +149,7 @@ fn default_app_data_dir() -> PathBuf {
 }
 
 #[cfg(windows)]
-fn query_windows_drives() -> Vec<UiDriveInfo> {
+pub fn query_windows_drives() -> Vec<UiDriveInfo> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW};
 
@@ -244,7 +223,7 @@ fn query_windows_drives() -> Vec<UiDriveInfo> {
 }
 
 #[cfg(not(windows))]
-fn query_windows_drives() -> Vec<UiDriveInfo> {
+pub fn query_windows_drives() -> Vec<UiDriveInfo> {
     vec![UiDriveInfo {
         id: "demo://100k-snapshot".to_string(),
         label: "100k Node Benchmark Snapshot".to_string(),
@@ -360,7 +339,7 @@ fn scan_node_recursive(
     })
 }
 
-fn scan_directory_snapshot(target: &str) -> Option<UiScanSnapshot> {
+pub fn scan_directory_snapshot(target: &str) -> Option<UiScanSnapshot> {
     if target.starts_with("demo://") {
         return None;
     }
@@ -401,7 +380,7 @@ fn scan_directory_snapshot(target: &str) -> Option<UiScanSnapshot> {
     })
 }
 
-fn find_real_duplicates(target: &str) -> Option<Vec<UiDuplicateGroup>> {
+pub fn find_real_duplicates(target: &str) -> Option<Vec<UiDuplicateGroup>> {
     if target.starts_with("demo://") {
         return None;
     }
@@ -517,7 +496,7 @@ fn find_real_duplicates(target: &str) -> Option<Vec<UiDuplicateGroup>> {
     Some(groups)
 }
 
-fn map_provider_id(kind: AgentProviderKind) -> &'static str {
+pub fn map_provider_id(kind: AgentProviderKind) -> &'static str {
     match kind {
         AgentProviderKind::Antigravity => "antigravity",
         AgentProviderKind::Kiro => "kiro",
@@ -528,7 +507,7 @@ fn map_provider_id(kind: AgentProviderKind) -> &'static str {
     }
 }
 
-fn detect_ui_providers() -> Vec<UiAgentProviderStatus> {
+pub fn detect_ui_providers() -> Vec<UiAgentProviderStatus> {
     let mut statuses: Vec<UiAgentProviderStatus> = discover_all_provider_statuses()
         .into_iter()
         .map(|st| UiAgentProviderStatus {
@@ -573,19 +552,20 @@ fn parse_provider(name: &str, custom_command: Option<&str>) -> Option<AgentProvi
     }
 }
 
-fn try_run_real_advisor(args: &Value) -> Option<Value> {
-    let provider_str = args.get("provider")?.as_str()?;
-    let prompt = args.get("prompt")?.as_str()?;
-    let target_path = args
-        .get("targetPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+pub fn try_run_real_advisor(
+    provider_str: &str,
+    prompt: &str,
+    target_path: Option<&str>,
+    target_name: Option<&str>,
+    target_size_bytes: Option<u64>,
+    custom_command: Option<&str>,
+) -> Option<Value> {
+    let target_path = target_path.unwrap_or("");
     if target_path.is_empty() || !Path::new(target_path).exists() {
         return None;
     }
 
-    let custom_cmd = args.get("customCommand").and_then(|v| v.as_str());
-    let provider = parse_provider(provider_str, custom_cmd)?;
+    let provider = parse_provider(provider_str, custom_command)?;
     if !matches!(provider, AgentProvider::Custom(_)) {
         let available = discover_all_provider_statuses()
             .into_iter()
@@ -595,13 +575,8 @@ fn try_run_real_advisor(args: &Value) -> Option<Value> {
         }
     }
 
-    let size_bytes = args
-        .get("targetSizeBytes")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let target_name = args
-        .get("targetName")
-        .and_then(|v| v.as_str())
+    let size_bytes = target_size_bytes.unwrap_or(0);
+    let resolved_name = target_name
         .map(ToString::to_string)
         .unwrap_or_else(|| target_path.to_string());
 
@@ -658,7 +633,7 @@ fn try_run_real_advisor(args: &Value) -> Option<Value> {
     Some(json!({
         "id": format!("adv-{}", Utc::now().timestamp_millis()),
         "targetPath": target_path,
-        "targetName": target_name,
+        "targetName": resolved_name,
         "targetSizeBytes": size_bytes,
         "provider": provider_str,
         "verdict": verdict,
@@ -671,7 +646,9 @@ fn try_run_real_advisor(args: &Value) -> Option<Value> {
     }))
 }
 
-fn map_vault_record(rec: windirstat_liquid_glass::vault::schema::VaultItemRecord) -> UiVaultItem {
+pub fn map_vault_record(
+    rec: crate::vault::schema::VaultItemRecord,
+) -> UiVaultItem {
     let now = Utc::now();
     let remaining_hours = chrono::DateTime::parse_from_rfc3339(&rec.expires_at_utc)
         .map(|exp| {
@@ -704,345 +681,42 @@ fn map_vault_record(rec: windirstat_liquid_glass::vault::schema::VaultItemRecord
     }
 }
 
-fn handle_invoke(ctx: &AppContext, req: InvokeRequest) -> Value {
-    match req.command.as_str() {
-        "list_drives" => serde_json::to_value(query_windows_drives()).unwrap_or(Value::Null),
-        "scan_directory" => {
-            let target = req.args.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            match scan_directory_snapshot(target) {
-                Some(snap) => serde_json::to_value(snap).unwrap_or(Value::Null),
-                None => Value::Null,
-            }
-        }
-        "find_duplicates" => {
-            let target = req.args.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            match find_real_duplicates(target) {
-                Some(groups) => serde_json::to_value(groups).unwrap_or(Value::Null),
-                None => Value::Null,
-            }
-        }
-        "detect_agent_clis" => serde_json::to_value(detect_ui_providers()).unwrap_or(Value::Null),
-        "ask_agent_advisor" => try_run_real_advisor(&req.args).unwrap_or(Value::Null),
-        "quarantine_item" => {
-            let path_str = req.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let path = Path::new(path_str);
-            if !path.is_file() {
-                return Value::Null;
-            }
-            let Ok(svc) = ctx.open_vault() else {
-                return Value::Null;
-            };
-            match svc.quarantine_items(
-                [path],
-                "UI Quarantine",
-                "desktop-session",
-                "desktop-ui",
-                "{}",
-                Utc::now(),
-            ) {
-                Ok(mut res) if !res.items.is_empty() => {
-                    serde_json::to_value(map_vault_record(res.items.remove(0))).unwrap_or(Value::Null)
-                }
-                _ => Value::Null,
-            }
-        }
-        "list_vault_items" => {
-            let Ok(svc) = ctx.open_vault() else {
-                return Value::Null;
-            };
-            let Ok(items) = svc.list_items_last_days(30, Utc::now()) else {
-                return Value::Null;
-            };
-            if items.is_empty() {
-                // Keep UI populated cleanly via tauriBridge demo items until first real quarantine
-                return Value::Null;
-            }
-            let mapped: Vec<UiVaultItem> = items.into_iter().map(map_vault_record).collect();
-            serde_json::to_value(mapped).unwrap_or(Value::Null)
-        }
-        "rollback_vault_item" => {
-            let id = req.args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if id.is_empty() {
-                return Value::Null;
-            }
-            let Ok(svc) = ctx.open_vault() else {
-                return Value::Null;
-            };
-            if svc.rollback_item(id).is_err() {
-                return Value::Null;
-            }
-            svc.get_item(id)
-                .ok()
-                .flatten()
-                .map(|r| serde_json::to_value(map_vault_record(r)).unwrap_or(Value::Null))
-                .unwrap_or(Value::Null)
-        }
-        "purge_vault_item" => Value::Null,
-        _ => Value::Null,
+pub fn quarantine_real_item(ctx: &AppContext, path_str: &str) -> Option<UiVaultItem> {
+    let path = Path::new(path_str);
+    if !path.is_file() {
+        return None;
     }
-}
-
-fn write_http_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()
-}
-
-fn handle_client(mut stream: TcpStream, ctx: &AppContext) {
-    let Ok(cloned) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(cloned);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-        return;
-    }
-
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET");
-    let raw_path = parts.next().unwrap_or("/");
-    let path = raw_path.split('?').next().unwrap_or("/");
-
-    let mut content_length: usize = 0;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            if k.eq_ignore_ascii_case("Content-Length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-
-    if method.eq_ignore_ascii_case("POST") && path == "/api/invoke" {
-        let mut body_buf = vec![0u8; content_length.min(4 * 1024 * 1024)];
-        if content_length > 0 && reader.read_exact(&mut body_buf).is_err() {
-            let _ = write_http_response(
-                &mut stream,
-                "400 Bad Request",
-                "application/json",
-                br#"{"error":"invalid request body"}"#,
-            );
-            return;
-        }
-        let result = match serde_json::from_slice::<InvokeRequest>(&body_buf) {
-            Ok(req) => handle_invoke(ctx, req),
-            Err(_) => Value::Null,
-        };
-        let payload = serde_json::to_vec(&result).unwrap_or_else(|_| b"null".to_vec());
-        let _ = write_http_response(
-            &mut stream,
-            "200 OK",
-            "application/json; charset=utf-8",
-            &payload,
-        );
-        return;
-    }
-
-    let lookup_path = if path == "/" { "/index.html" } else { path };
-    if let Some((bytes, mime)) = get_embedded_asset(lookup_path) {
-        if lookup_path == "/index.html" {
-            let html = String::from_utf8_lossy(bytes).replace(
-                "</head>",
-                "<script>window.__WDS_DESKTOP_EXE__=true;</script></head>",
-            );
-            let _ = write_http_response(&mut stream, "200 OK", mime, html.as_bytes());
-        } else {
-            let _ = write_http_response(&mut stream, "200 OK", mime, bytes);
-        }
-        return;
-    }
-
-    if let Some((bytes, mime)) = get_embedded_asset("/index.html") {
-        let html = String::from_utf8_lossy(bytes).replace(
-            "</head>",
-            "<script>window.__WDS_DESKTOP_EXE__=true;</script></head>",
-        );
-        let _ = write_http_response(&mut stream, "200 OK", mime, html.as_bytes());
-        return;
-    }
-
-    let _ = write_http_response(&mut stream, "404 Not Found", "text/plain", b"Not Found");
-}
-
-fn find_app_browser_exe() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(local) = env::var_os("LOCALAPPDATA") {
-        let local_path = PathBuf::from(&local);
-        candidates.push(local_path.join(r"ms-playwright\chromium-1255\chrome-win64\chrome.exe"));
-        candidates.push(local_path.join(r"Google\Chrome\Application\chrome.exe"));
-    }
-    if let Some(pf86) = env::var_os("ProgramFiles(x86)") {
-        candidates.push(PathBuf::from(pf86).join(r"Microsoft\Edge\Application\msedge.exe"));
-    }
-    if let Some(pf) = env::var_os("ProgramFiles") {
-        candidates.push(PathBuf::from(&pf).join(r"Microsoft\Edge\Application\msedge.exe"));
-        candidates.push(PathBuf::from(pf).join(r"Google\Chrome\Application\chrome.exe"));
-    }
-    candidates.into_iter().find(|p| p.is_file())
-}
-
-fn launch_desktop_window(url: &str, app_data_dir: &Path) -> Option<Child> {
-    let profile_dir = app_data_dir.join("app-profile");
-    let _ = fs::create_dir_all(&profile_dir);
-
-    if let Some(browser) = find_app_browser_exe() {
-        if let Ok(child) = Command::new(browser)
-            .arg(format!("--app={url}"))
-            .arg("--window-size=1440,920")
-            .arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .spawn()
-        {
-            return Some(child);
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
-    }
-    None
-}
-
-fn run_self_test(addr: std::net::SocketAddr) -> Result<(), String> {
-    let mut root_stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
-    write!(
-        root_stream,
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|e| e.to_string())?;
-    let mut root_resp = String::new();
-    root_stream
-        .read_to_string(&mut root_resp)
-        .map_err(|e| e.to_string())?;
-    if !root_resp.contains("200 OK") || !root_resp.contains("__WDS_DESKTOP_EXE__") {
-        return Err("Embedded index.html self-test failed".to_string());
-    }
-
-    for cmd in ["list_drives", "detect_agent_clis", "list_vault_items"] {
-        let mut api_stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
-        let body = format!(r#"{{"command":"{cmd}","args":{{}}}}"#);
-        write!(
-            api_stream,
-            "POST /api/invoke HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+    let svc = ctx.open_vault().ok()?;
+    let mut res = svc
+        .quarantine_items(
+            [path],
+            "UI Quarantine",
+            "desktop-session",
+            "desktop-ui",
+            "{}",
+            Utc::now(),
         )
-        .map_err(|e| e.to_string())?;
-        let mut api_resp = String::new();
-        api_stream
-            .read_to_string(&mut api_resp)
-            .map_err(|e| e.to_string())?;
-        if !api_resp.contains("200 OK") {
-            return Err(format!("/api/invoke {cmd} did not return 200 OK"));
-        }
+        .ok()?;
+    if res.items.is_empty() {
+        return None;
     }
-
-    println!("WinDirStat-LiquidGlass.exe self-test PASSED on http://{addr}");
-    Ok(())
+    Some(map_vault_record(res.items.remove(0)))
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let mut no_open = false;
-    let mut self_test = false;
-    let mut port: u16 = 0;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--no-open" => no_open = true,
-            "--self-test" => {
-                self_test = true;
-                no_open = true;
-            }
-            "--port" if i + 1 < args.len() => {
-                port = args[i + 1].parse().unwrap_or(0);
-                i += 1;
-            }
-            _ => {}
-        }
-        i += 1;
+pub fn list_real_vault_items(ctx: &AppContext) -> Option<Vec<UiVaultItem>> {
+    let svc = ctx.open_vault().ok()?;
+    let items = svc.list_items_last_days(30, Utc::now()).ok()?;
+    if items.is_empty() {
+        return None;
     }
+    Some(items.into_iter().map(map_vault_record).collect())
+}
 
-    let app_dir = default_app_data_dir();
-    let _ = fs::create_dir_all(&app_dir);
-    let ctx = Arc::new(AppContext {
-        vault_db_path: app_dir.join("vault_manifest.db"),
-    });
-
-    // Keep 7-day vault expiration worker active while running
-    let _worker = ctx
-        .open_vault()
-        .ok()
-        .map(|svc| start_expiration_worker(Arc::new(svc)));
-
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind localhost port");
-    let local_addr = listener.local_addr().expect("read local addr");
-    let _ = listener.set_nonblocking(true);
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_srv = Arc::clone(&shutdown);
-    let ctx_srv = Arc::clone(&ctx);
-
-    let server_handle = thread::spawn(move || {
-        while !shutdown_srv.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let ctx_req = Arc::clone(&ctx_srv);
-                    thread::spawn(move || handle_client(stream, &ctx_req));
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(15));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    if self_test {
-        let res = run_self_test(local_addr);
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = server_handle.join();
-        if let Err(err) = res {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
-        return;
+pub fn rollback_real_vault_item(ctx: &AppContext, id: &str) -> Option<UiVaultItem> {
+    if id.is_empty() {
+        return None;
     }
-
-    let url = format!("http://{local_addr}");
-    println!("WinDirStat Liquid Glass running at {url}");
-
-    if no_open {
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
-    } else if let Some(mut child) = launch_desktop_window(&url, &app_dir) {
-        let _ = child.wait();
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = server_handle.join();
-    } else {
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
-    }
+    let svc = ctx.open_vault().ok()?;
+    svc.rollback_item(id).ok()?;
+    svc.get_item(id).ok().flatten().map(map_vault_record)
 }

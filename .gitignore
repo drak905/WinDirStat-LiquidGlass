@@ -87,3 +87,4 @@ coverage/
 
 # Standalone compiled executables at repo root
 /*.exe
+src-tauri/gen/

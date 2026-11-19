@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exclude compiled build artifact caches and upstream legacy 2012-2015 sqlite3 C amalgamation false positives"
+paths = [
+    '''(^|[/\\])target[/\\]''',
+    '''(^|[/\\])node_modules[/\\]''',
+    '''(^|/)[Bb]uild[/\\]''',
+    '''(^|[/\\])dist[/\\]''',
+    '''(^|[/\\])playwright-report[/\\]''',
+    '''(^|[/\\])test-results[/\\]''',
+    '''(^|[/\\])sqlite3[/\\]''',
+]
