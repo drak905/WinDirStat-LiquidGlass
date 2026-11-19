@@ -613,6 +613,298 @@ pub fn extract_windows_path_from_prompt(prompt: &str) -> Option<String> {
     None
 }
 
+/// Extracts an explicit drive root (`C:\`, `D:\`, etc.) from prompts like "analyze current disk C"
+/// or "free space on drive D:".
+pub fn extract_drive_root_from_prompt(prompt: &str) -> Option<String> {
+    let lower = prompt.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+
+    for keyword in ["disk ", "drive ", "volume "] {
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(keyword) {
+            let abs = search_from + rel;
+            let prev_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+            let letter_idx = abs + keyword.len();
+            if prev_ok && letter_idx < bytes.len() && bytes[letter_idx].is_ascii_alphabetic() {
+                let after = bytes.get(letter_idx + 1).copied();
+                let next_after = bytes.get(letter_idx + 2).copied();
+                let is_drive_ref = match after {
+                    None => true,
+                    Some(b':') => matches!(
+                        next_after,
+                        None | Some(b'\\' | b'/' | b' ' | b'\t' | b'\r' | b'\n' | b',' | b'.' | b'?' | b'!' | b';' | b')')
+                    ),
+                    Some(b' ' | b'\t' | b'\r' | b'\n' | b',' | b'.' | b'?' | b'!' | b';' | b')') => true,
+                    _ => false,
+                };
+                if is_drive_ref {
+                    let letter = (bytes[letter_idx] as char).to_ascii_uppercase();
+                    return Some(format!("{letter}:\\"));
+                }
+            }
+            search_from = abs + keyword.len();
+        }
+    }
+
+    // Also match standalone `C:` / `C:\` references (excluding URL schemes such as `http://`).
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let prev_ok = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+        if prev_ok && bytes[i].is_ascii_alphabetic() && bytes[i + 1] == b':' {
+            let after = bytes.get(i + 2).copied();
+            let valid_sep = matches!(
+                after,
+                None | Some(b' ' | b'\t' | b'\r' | b'\n' | b',' | b'.' | b'?' | b'!' | b';' | b')' | b'\\' | b'/')
+            ) && !(after == Some(b'/') && bytes.get(i + 3).copied() == Some(b'/'));
+            if valid_sep {
+                let letter = (bytes[i] as char).to_ascii_uppercase();
+                return Some(format!("{letter}:\\"));
+            }
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn format_human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn bounded_measure_path(
+    path: &Path,
+    per_cap_ms: u128,
+    max_entries: usize,
+    global_deadline: Instant,
+) -> Option<(u64, usize, bool)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    if meta.is_file() {
+        return Some((meta.len(), 1, false));
+    }
+    if !meta.is_dir() {
+        return None;
+    }
+
+    let started = Instant::now();
+    let mut stack = vec![path.to_path_buf()];
+    let mut total_bytes = 0u64;
+    let mut file_count = 0usize;
+    let mut visited = 0usize;
+    let mut truncated = false;
+
+    while let Some(dir) = stack.pop() {
+        if visited >= max_entries
+            || started.elapsed().as_millis() >= per_cap_ms
+            || Instant::now() >= global_deadline
+        {
+            truncated = true;
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if visited >= max_entries
+                || started.elapsed().as_millis() >= per_cap_ms
+                || Instant::now() >= global_deadline
+            {
+                truncated = true;
+                break;
+            }
+            visited += 1;
+            let p = entry.path();
+            let Ok(m) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            if m.is_file() {
+                total_bytes = total_bytes.saturating_add(m.len());
+                file_count += 1;
+            } else if m.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+
+    Some((total_bytes, file_count, truncated))
+}
+
+/// Builds a fast, bounded (`<= 2.5s`) native storage telemetry snapshot for a Windows drive
+/// (volume totals, key Windows cleanup hotspots, and top-level directory weights) so Agent CLIs
+/// do not hang running recursive shell scans across `C:\`.
+pub fn build_drive_analysis_context(drive_root: &str, ui_scan_summary: Option<&str>) -> String {
+    let trimmed = drive_root.trim();
+    let normalized_drive = if trimmed.len() == 1 && trimmed.as_bytes()[0].is_ascii_alphabetic() {
+        format!("{}:\\", trimmed.to_ascii_uppercase())
+    } else if trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!("{}\\", trimmed.to_ascii_uppercase())
+    } else if trimmed.len() >= 3 && trimmed.as_bytes()[1] == b':' {
+        format!("{}:\\", (trimmed.as_bytes()[0] as char).to_ascii_uppercase())
+    } else {
+        trimmed.to_string()
+    };
+
+    let drives = query_windows_drives();
+    let volume_line = if let Some(d) = drives
+        .iter()
+        .find(|d| d.mount_point.eq_ignore_ascii_case(&normalized_drive))
+    {
+        let used_pct = if d.total_bytes > 0 {
+            ((d.used_bytes as f64) / (d.total_bytes as f64)) * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "- Volume {}: Total {} | Used {} ({:.1}%) | Free {}",
+            d.mount_point,
+            format_human_bytes(d.total_bytes),
+            format_human_bytes(d.used_bytes),
+            used_pct,
+            format_human_bytes(d.free_bytes)
+        )
+    } else {
+        format!("- Target Drive: {normalized_drive}")
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(2_500);
+    let mut candidate_hotspots: Vec<(PathBuf, &'static str)> = Vec::new();
+    let drive_prefix = normalized_drive.to_ascii_lowercase();
+
+    if let Ok(local_app) = env::var("LOCALAPPDATA") {
+        let p = PathBuf::from(local_app);
+        for (sub, label) in [
+            ("Temp", "User Temp files"),
+            ("Docker", "Docker Desktop VM/data"),
+            ("Packages", "Microsoft Store / UWP app packages"),
+            ("npm-cache", "npm download cache"),
+            ("pip\\Cache", "Python pip wheel/http cache"),
+        ] {
+            let cand = p.join(sub);
+            if cand.to_string_lossy().to_ascii_lowercase().starts_with(&drive_prefix) {
+                candidate_hotspots.push((cand, label));
+            }
+        }
+    }
+    if let Ok(profile) = env::var("USERPROFILE") {
+        let p = PathBuf::from(profile);
+        for (sub, label) in [
+            ("Downloads", "User Downloads folder (installers/archives/ISOs)"),
+            (".cargo\\registry\\cache", "Rust Cargo crate cache"),
+        ] {
+            let cand = p.join(sub);
+            if cand.to_string_lossy().to_ascii_lowercase().starts_with(&drive_prefix) {
+                candidate_hotspots.push((cand, label));
+            }
+        }
+    }
+
+    let drive_base = Path::new(&normalized_drive);
+    for (rel, label) in [
+        ("Windows\\Temp", "Windows system Temp folder"),
+        ("Windows\\SoftwareDistribution\\Download", "Windows Update download cache"),
+        ("Windows\\Installer", "MSI installer database (OS critical)"),
+        ("Windows\\WinSxS", "Windows Component Store (use DISM / Disk Cleanup)"),
+        ("hiberfil.sys", "Windows hibernation file"),
+        ("pagefile.sys", "Windows virtual memory pagefile"),
+    ] {
+        candidate_hotspots.push((drive_base.join(rel), label));
+    }
+
+    let mut measured: Vec<(u64, usize, bool, String, &'static str)> = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    for (path, note) in candidate_hotspots {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if !seen_paths.insert(key) || !path.exists() {
+            continue;
+        }
+        if let Some((bytes, files, truncated)) = bounded_measure_path(&path, 350, 6_000, deadline) {
+            if bytes > 0 {
+                measured.push((
+                    bytes,
+                    files,
+                    truncated,
+                    path.to_string_lossy().into_owned(),
+                    note,
+                ));
+            }
+        }
+    }
+
+    if let Ok(top_entries) = fs::read_dir(drive_base) {
+        for entry in top_entries.flatten() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let p = entry.path();
+            let key = p.to_string_lossy().to_ascii_lowercase();
+            if !seen_paths.insert(key) {
+                continue;
+            }
+            if let Some((bytes, files, truncated)) = bounded_measure_path(&p, 200, 2_500, deadline) {
+                if bytes >= 32 * 1024 * 1024 {
+                    measured.push((
+                        bytes,
+                        files,
+                        truncated,
+                        p.to_string_lossy().into_owned(),
+                        "Top-level drive entry",
+                    ));
+                }
+            }
+        }
+    }
+
+    measured.sort_by(|a, b| b.0.cmp(&a.0));
+    measured.truncate(12);
+
+    let mut lines = vec![volume_line];
+    if measured.is_empty() {
+        lines.push("- Measured hotspots: (none readable at current permission level)".to_string());
+    } else {
+        lines.push("- Measured drive hotspots / top folders (bounded native scan):".to_string());
+        for (idx, (bytes, files, truncated, path_str, note)) in measured.iter().enumerate() {
+            let plus = if *truncated { "+" } else { "" };
+            lines.push(format!(
+                "  {}. `{}` — {}{} ({}{} files; {})",
+                idx + 1,
+                path_str,
+                format_human_bytes(*bytes),
+                plus,
+                files,
+                plus,
+                note
+            ));
+        }
+    }
+
+    if let Some(ui_summary) = ui_scan_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        lines.push(format!("- Active WinDirStat UI Scan Snapshot:\n{ui_summary}"));
+    }
+
+    lines.join("\n")
+}
+
 fn provider_display_label(provider_str: &str) -> &'static str {
     match provider_str {
         "antigravity" => "Antigravity CLI",
@@ -1002,6 +1294,17 @@ fn stdout_has_opencode_error_only(stdout: &str) -> bool {
     })
 }
 
+fn build_error_hint_for_err(err: &AgentHubError, install_hint: Option<&str>) -> Option<String> {
+    match err {
+        AgentHubError::BinaryNotFound { .. } => install_hint.map(ToString::to_string),
+        AgentHubError::Timeout { .. } => Some(
+            "Tip: Broad full-drive prompts with internet verification can take longer on large disks. Try asking about a specific folder from the Treemap (right-click -> Ask Agent CLI), or pick a faster model."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_real_advisor_async(
     provider_str: &str,
@@ -1012,6 +1315,7 @@ pub async fn run_real_advisor_async(
     custom_command: Option<&str>,
     active_drive: Option<&str>,
     model: Option<&str>,
+    scan_summary: Option<&str>,
 ) -> Value {
     let trimmed_prompt = prompt.trim();
     let explicit_target = target_path.map(str::trim).filter(|s| !s.is_empty());
@@ -1159,17 +1463,40 @@ pub async fn run_real_advisor_async(
     };
 
     let context_json = payload.to_compact_json().unwrap_or_else(|_| "{}".to_string());
+    let effective_drive = extract_drive_root_from_prompt(trimmed_prompt).or(clean_active_drive.clone());
+    let clean_scan_summary = scan_summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
     let prompt_to_send = if is_targeted_inspection {
         build_cross_check_system_prompt(&payload)
     } else {
+        let drive_telemetry = if let Some(drive) = effective_drive.clone() {
+            let summary_owned = clean_scan_summary.clone();
+            tokio::task::spawn_blocking(move || {
+                build_drive_analysis_context(&drive, summary_owned.as_deref())
+            })
+            .await
+            .unwrap_or_default()
+        } else if let Some(summary_only) = clean_scan_summary {
+            format!("- Active WinDirStat UI Scan Snapshot:\n{summary_only}")
+        } else {
+            "- Volume: (not specified)".to_string()
+        };
+
         format!(
             "You are the WinDirStat Storage Intelligence Advisor inside WinDirStat Liquid Glass.\n\
-             Active drive context: {active}\n\
-             Answer the user's question directly and concisely in plain text or Markdown.\n\
-             Include verified public documentation URLs (https://...) where helpful, and recommend using the 7-Day Quarantine Vault rather than permanent deletion when discussing file removal.\n\
-             If the user asks whether a specific file or directory path is safe to delete or keep, include a ```json``` block conforming to fields: verdict (SAFE_TO_DELETE|SAFE_WITH_APP_CLOSED|CLEAN_VIA_OFFICIAL_TOOL|KEEP_CRITICAL), risk_score (0-100), reclaimable_bytes, usage_value_assessment, cross_checked_sources (>=3 objects with title, url, source_type, finding), recommended_action.\n\n\
+             WinDirStat has ALREADY scanned the drive in native code and provided real sizes below.\n\
+             DO NOT run shell commands, PowerShell scripts, or recursive directory scans (such as Get-ChildItem -Recurse or du) over the drive.\n\
+             Use the WinDirStat scan summary directly, and spend your tool calls ONLY verifying trusted public internet sources (at least 3 distinct https:// URLs) for the top cleanup targets.\n\n\
+             ### WinDirStat Native Drive Scan Summary\n\
+             {drive_telemetry}\n\n\
+             Respond concisely in Markdown with:\n\
+             1. A prioritized cleanup table grouping candidates into **Safe to Quarantine**, **Clean via Official Tool**, and **Keep Critical** (using only sizes reported above).\n\
+             2. Clear reminder to route manual removals through WinDirStat's **7-Day Quarantine Vault** rather than permanent deletion.\n\
+             3. At least 3 verified public `https://` documentation links supporting those safety verdicts.\n\n\
              User Question:\n{question}",
-            active = clean_active_drive.as_deref().unwrap_or("None"),
             question = trimmed_prompt,
         )
     };
@@ -1177,7 +1504,7 @@ pub async fn run_real_advisor_async(
     let runner = AgentHubRunner::with_resolver(
         Arc::new(DefaultCommandResolver),
         RunnerConfig {
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_secs(180),
             self_test_timeout: Duration::from_secs(15),
         },
     );
@@ -1231,8 +1558,61 @@ pub async fn run_real_advisor_async(
         Err(err) => {
             let err_cmd = match &used_model {
                 Some(m) => format!("{default_cmd_label} ({m})"),
-                None => default_cmd_label,
+                None => default_cmd_label.clone(),
             };
+            if let AgentHubError::Timeout {
+                partial_stdout,
+                timeout_ms,
+                ..
+            } = &err
+            {
+                if let Some(partial_text) = extract_assistant_text(partial_stdout) {
+                    if partial_text.trim().chars().count() >= 120 {
+                        let noted_reply = format!(
+                            "{}\n\n> Note: Response reached the {}s time limit while finalizing; partial output is shown above.",
+                            partial_text.trim(),
+                            timeout_ms / 1000
+                        );
+                        let sources: Vec<Value> = extract_external_urls_from_text(&partial_text)
+                            .into_iter()
+                            .map(|(url, domain)| {
+                                json!({
+                                    "title": domain,
+                                    "url": url,
+                                    "domain": domain,
+                                    "verified": true,
+                                    "snippet": format!("Referenced in {err_cmd} partial response"),
+                                })
+                            })
+                            .collect();
+                        return json!({
+                            "id": format!("adv-{}", Utc::now().timestamp_millis()),
+                            "targetPath": resolved_target_path,
+                            "targetName": resolved_name,
+                            "targetSizeBytes": resolved_size_bytes,
+                            "provider": provider_str,
+                            "verdict": "REVIEW_CAREFULLY",
+                            "risk_score": 0,
+                            "reclaimable_bytes": 0,
+                            "usage_value_assessment": noted_reply,
+                            "rationale": format!(
+                                "Partial live reply from {} ({}s limit reached)",
+                                err_cmd,
+                                timeout_ms / 1000
+                            ),
+                            "sources": sources,
+                            "createdAt": Utc::now().to_rfc3339(),
+                            "userPrompt": trimmed_prompt,
+                            "responseMode": "chat",
+                            "assistantReply": noted_reply,
+                            "isLiveCli": true,
+                            "resolvedCommand": err_cmd,
+                            "durationMs": *timeout_ms as u64,
+                        });
+                    }
+                }
+            }
+            let error_hint = build_error_hint_for_err(&err, install_hint.as_deref());
             return make_error_response(
                 provider_str,
                 trimmed_prompt,
@@ -1240,7 +1620,7 @@ pub async fn run_real_advisor_async(
                 &resolved_name,
                 resolved_size_bytes,
                 format_friendly_cli_error(provider_str, &err),
-                install_hint,
+                error_hint,
                 Some(err_cmd),
             );
         }
@@ -1533,6 +1913,7 @@ mod tests {
             None,
             Some("C:\\"),
             None,
+            None,
         )
         .await;
         println!("LIVE CHAT: {chat_res}");
@@ -1551,6 +1932,7 @@ mod tests {
             None,
             Some("C:\\"),
             None,
+            None,
         )
         .await;
         println!("LIVE INSPECT: {inspect_res}");
@@ -1559,6 +1941,82 @@ mod tests {
             matches!(inspect_res["responseMode"].as_str(), Some("chat" | "verdict")),
             "unexpected inspect response: {inspect_res}"
         );
+    }
+
+    #[test]
+    fn extracts_drive_mentions_and_builds_fast_bounded_drive_context() {
+        assert_eq!(
+            extract_drive_root_from_prompt(
+                "so i want you analyze current disk C for me, so that we can decide which folder or file we can free up space"
+            ),
+            Some("C:\\".to_string())
+        );
+        assert_eq!(
+            extract_drive_root_from_prompt("Check drive D please"),
+            Some("D:\\".to_string())
+        );
+        assert_eq!(
+            extract_drive_root_from_prompt("How much is free on e:?"),
+            Some("E:\\".to_string())
+        );
+        assert_eq!(
+            extract_drive_root_from_prompt("Compare https://learn.microsoft.com/en-us/windows"),
+            None
+        );
+        assert_eq!(extract_drive_root_from_prompt("Hello Kiro"), None);
+
+        let started = Instant::now();
+        let ctx = build_drive_analysis_context("C:\\", Some("Custom UI scan line"));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "drive context builder took too long: {elapsed:?}"
+        );
+        assert!(ctx.contains("C:\\"), "ctx={ctx}");
+        assert!(ctx.contains("Custom UI scan line"), "ctx={ctx}");
+
+        let timeout_err = AgentHubError::Timeout {
+            program: "kiro-cli".to_string(),
+            timeout_ms: 180_000,
+            partial_stdout: String::new(),
+        };
+        let timeout_hint = build_error_hint_for_err(&timeout_err, Some("Install Kiro CLI"))
+            .expect("expected timeout tip");
+        assert!(!timeout_hint.contains("Install Kiro CLI"));
+        assert!(timeout_hint.contains("Treemap"));
+
+        let missing_err = AgentHubError::BinaryNotFound {
+            program: "kiro".to_string(),
+        };
+        assert_eq!(
+            build_error_hint_for_err(&missing_err, Some("Install Kiro CLI")).as_deref(),
+            Some("Install Kiro CLI")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Invokes live local kiro-cli process with network access on exact user disk C prompt"]
+    async fn live_kiro_disk_c_analysis_smoke() {
+        let res = run_real_advisor_async(
+            "kiro",
+            "so i want you analyze current disk C for me, so that we can decide which folder or file we can free up space, alos, you should double check with trust source on the internet to verify it is safe to remove or not",
+            None,
+            None,
+            None,
+            None,
+            Some("C:\\"),
+            None,
+            None,
+        )
+        .await;
+        println!("LIVE DISK C KIRO: {res}");
+        assert_eq!(res["isLiveCli"], json!(true), "res={res}");
+        assert!(
+            matches!(res["responseMode"].as_str(), Some("chat" | "verdict")),
+            "unexpected mode: {res}"
+        );
+        let sources_len = res["sources"].as_array().map_or(0, Vec::len);
+        assert!(sources_len >= 3, "expected >=3 verified sources, got {sources_len}: {res}");
     }
 
     #[test]
@@ -1618,6 +2076,7 @@ mod tests {
             None,
             None,
             Some("C:\\"),
+            None,
             None,
         )
         .await;

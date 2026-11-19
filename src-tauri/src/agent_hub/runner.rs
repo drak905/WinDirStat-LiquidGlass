@@ -36,7 +36,11 @@ pub enum AgentHubError {
     #[error("failed to spawn agent CLI `{program}`: {reason}")]
     SpawnFailed { program: String, reason: String },
     #[error("agent CLI `{program}` timed out after {timeout_ms} ms")]
-    Timeout { program: String, timeout_ms: u128 },
+    Timeout {
+        program: String,
+        timeout_ms: u128,
+        partial_stdout: String,
+    },
     #[error("agent CLI `{program}` exited with status {exit_code:?}: {stderr}")]
     ProcessFailed {
         program: String,
@@ -642,11 +646,16 @@ async fn execute_subprocess(
         WaitOutcome::TimedOut => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            stdout_task.abort();
             stderr_task.abort();
+            let partial_stdout = tokio::time::timeout(Duration::from_millis(500), stdout_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
             return Err(AgentHubError::Timeout {
                 program: resolved.program.display().to_string(),
                 timeout_ms: timeout.as_millis(),
+                partial_stdout,
             });
         }
         WaitOutcome::FatalStderr => {

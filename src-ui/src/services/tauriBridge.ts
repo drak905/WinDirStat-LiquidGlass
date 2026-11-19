@@ -286,6 +286,7 @@ const defaultBridge: WdsBridge = {
       customCommand: params.customCommand,
       activeDrive: params.activeDrive,
       model: params.model,
+      scanSummary: params.scanSummary,
     };
 
     if (isTauriRuntime()) {

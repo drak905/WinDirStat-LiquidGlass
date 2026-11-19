@@ -254,4 +254,24 @@ describe('Agent CLI Storage Advisor Chat', () => {
       model: 'opencode/big-pickle',
     });
   });
+
+  it('displays live elapsed seconds in streaming indicator while querying a CLI', () => {
+    render(
+      <AgentAdvisorPanel
+        providers={[
+          { provider: 'kiro', displayName: 'Kiro CLI', available: true, command: 'kiro-cli', latencyMs: 45 },
+        ]}
+        selectedProvider="kiro"
+        onProviderChange={() => {}}
+        responses={[]}
+        isStreaming={true}
+        onSendPrompt={async () => {}}
+        onQuarantineRecommended={async () => {}}
+      />
+    );
+
+    expect(screen.getByTestId('agent-streaming-banner')).toHaveTextContent(
+      /Running\s+kiro-cli\s+CLI.*\(0s\)/
+    );
+  });
 });

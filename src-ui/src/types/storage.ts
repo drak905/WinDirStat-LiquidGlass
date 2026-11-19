@@ -142,6 +142,7 @@ export interface AskAgentAdvisorParams {
   customCommand?: string;
   activeDrive?: string;
   model?: string;
+  scanSummary?: string;
 }
 
 export interface AgentCliTestResult {

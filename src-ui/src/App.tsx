@@ -30,6 +30,26 @@ interface ContextState {
   target: ContextMenuTarget | null;
 }
 
+function buildUiScanSummary(snapshot: ScanSnapshot, duplicates: DuplicateGroup[]): string {
+  const topDirs = (snapshot.root.children ?? [])
+    .slice(0, 10)
+    .map((c) => `  - ${c.path} (${formatBytes(c.size)}, ${c.fileCount} files)`)
+    .join('\n');
+  const topExts = snapshot.extensions
+    .slice(0, 6)
+    .map((e) => `${e.extension}: ${formatBytes(e.totalBytes)} (${e.fileCount})`)
+    .join(', ');
+  const dupWaste = duplicates.reduce((acc, g) => acc + g.wastedBytes, 0);
+  return [
+    `Drive ${snapshot.driveId}: ${snapshot.totalNodes.toLocaleString('en-US')} indexed nodes, ${formatBytes(snapshot.root.size)} scanned`,
+    topDirs ? `Top children:\n${topDirs}` : '',
+    topExts ? `Top extensions: ${topExts}` : '',
+    dupWaste > 0 ? `Duplicate waste detected: ${formatBytes(dupWaste)} across ${duplicates.length} groups` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 export function App() {
   const [darkMode, setDarkMode] = useState(true);
   const [drives, setDrives] = useState<DriveInfo[]>(() => createDemoDrives());
@@ -43,6 +63,7 @@ export function App() {
   const [advisorResponses, setAdvisorResponses] = useState<AgentAdvisorResponse[]>([]);
   const [isStreamingAdvice, setIsStreamingAdvice] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
+  const [hasRealScan, setHasRealScan] = useState(false);
   const [activeTab, setActiveTab] = useState<NavTabId>('treemap');
   const [contextMenu, setContextMenu] = useState<ContextState>({ x: 0, y: 0, target: null });
   const [externalZoomTarget, setExternalZoomTarget] = useState<StorageNode | null>(null);
@@ -126,6 +147,7 @@ export function App() {
         ]);
         setSnapshot(newSnap);
         setDuplicates(newDups);
+        setHasRealScan(!target.startsWith('demo://'));
         showToast(
           `Scanned ${newSnap.totalNodes.toLocaleString()} nodes (${formatBytes(newSnap.root.size)}) in ${newSnap.scanDurationMs}ms`
         );
@@ -152,6 +174,7 @@ export function App() {
         const response = await bridge.askAgentAdvisor({
           ...params,
           activeDrive: selectedDrive,
+          scanSummary: hasRealScan ? buildUiScanSummary(snapshot, duplicates) : undefined,
         });
         setAdvisorResponses((prev) => [response, ...prev]);
         return response;
@@ -182,7 +205,7 @@ export function App() {
         setIsStreamingAdvice(false);
       }
     },
-    [selectedDrive, showToast]
+    [duplicates, hasRealScan, selectedDrive, showToast, snapshot]
   );
 
   const handleQuarantine = useCallback(

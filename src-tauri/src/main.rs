@@ -160,6 +160,7 @@ async fn ask_agent_advisor(
     custom_command: Option<String>,
     active_drive: Option<String>,
     model: Option<String>,
+    scan_summary: Option<String>,
 ) -> Value {
     run_real_advisor_async(
         &provider,
@@ -170,6 +171,7 @@ async fn ask_agent_advisor(
         custom_command.as_deref(),
         active_drive.as_deref(),
         model.as_deref(),
+        scan_summary.as_deref(),
     )
     .await
 }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Bot,
   Send,
@@ -82,6 +82,19 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
   const [selectedOpenCodeModel, setSelectedOpenCodeModel] = useState('');
   const [quarantinedIds, setQuarantinedIds] = useState<Record<string, boolean>>({});
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      setElapsedSec(0);
+      return;
+    }
+    setElapsedSec(0);
+    const id = setInterval(() => {
+      setElapsedSec((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isStreaming]);
 
   const activeProviderStatus = providers.find((p) => p.provider === selectedProvider);
   const availableBuiltins = providers.filter((p) => p.available && p.provider !== 'custom');
@@ -269,14 +282,17 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
       {/* Streaming Response Cards Feed */}
       <div className="glass-scroll min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
         {isStreaming && (
-          <div className="liquid-glass-card liquid-spring-enter flex items-center gap-3 rounded-3xl p-4 text-xs">
+          <div
+            data-testid="agent-streaming-banner"
+            className="liquid-glass-card liquid-spring-enter flex items-center gap-3 rounded-3xl p-4 text-xs"
+          >
             <Sparkles className="h-4 w-4 animate-pulse text-sky-400" />
             <span className="font-medium text-slate-800 dark:text-slate-200">
               Running{' '}
               <strong className="font-mono">
                 {activeProviderStatus?.command ?? selectedProvider}
               </strong>{' '}
-              CLI&hellip; (live queries can take 10&ndash;40s)
+              CLI&hellip; ({elapsedSec}s) &mdash; analyzing WinDirStat scan data &amp; cross-checking internet sources
             </span>
           </div>
         )}
@@ -295,6 +311,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
             </div>
             <div className="flex flex-wrap justify-center gap-2">
               {[
+                'Analyze current disk C: and suggest safe folders to free up space with trusted internet sources',
                 'Should I delete C:\\Windows\\Temp\\installer-cache-bundle.tmp?',
                 'Is docker_data.vhdx safe to remove?',
                 'Check C:\\Users\\thinh\\Downloads\\ubuntu-24.04.1-desktop-amd64.iso',

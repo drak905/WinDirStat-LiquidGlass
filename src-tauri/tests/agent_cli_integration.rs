@@ -141,14 +141,16 @@ if (mode === 'kiro-cli') {
     args[1] !== 'chat' ||
     args[2] !== '--no-interactive' ||
     args[3] !== '--trust-workspace' ||
-    args[4] !== '--trust-tools=fs_read,web_search,web_fetch' ||
-    args[5] !== '--output-format' ||
-    args[6] !== 'stream-json'
+    args[4] !== '--effort' ||
+    args[5] !== 'medium' ||
+    args[6] !== '--trust-tools=fs_read,web_search,web_fetch' ||
+    args[7] !== '--output-format' ||
+    args[8] !== 'stream-json'
   ) {
     console.error('Unexpected kiro-cli args: ' + JSON.stringify(args));
     process.exit(2);
   }
-  assertContains(args[7], 'Source Type A', 'prompt');
+  assertContains(args[9], 'Source Type A', 'prompt');
   const fenced = "```json\n" + JSON.stringify(validPayload) + "\n```";
   console.log(JSON.stringify({ type: 'runStarted', data: { payloadSchema: 'acp', engine: 'v3' } }));
   console.log(JSON.stringify({ type: 'sessionUpdate', data: { sessionId: 'sess_mock', update: { sessionUpdate: 'session_info_update' } } }));
