@@ -20,6 +20,10 @@ path = "src/bin/wds-vault.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

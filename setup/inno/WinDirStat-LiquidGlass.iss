@@ -20,6 +20,9 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\WinDirStat-LiquidGlass.exe
 WizardStyle=modern
+CloseApplications=yes
+CloseApplicationsFilter=*.exe
+AppMutex=Local\WinDirStatLiquidGlass_PrimaryWebView2
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked

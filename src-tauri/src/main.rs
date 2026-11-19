@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::fs;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -16,6 +18,106 @@ use windirstat_liquid_glass::vault::service::start_expiration_worker;
 
 struct SharedDesktopState {
     ctx: Arc<AppContext>,
+}
+
+#[cfg(windows)]
+struct WebView2IsolationGuard {
+    mutex_handle: windows_sys::Win32::Foundation::HANDLE,
+    temp_data_dir: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+impl Drop for WebView2IsolationGuard {
+    fn drop(&mut self) {
+        if !self.mutex_handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.mutex_handle);
+            }
+        }
+        if let Some(dir) = &self.temp_data_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_default_webview2_locked() -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let Some(local) = env::var_os("LOCALAPPDATA") else {
+        return false;
+    };
+    let lockfile = PathBuf::from(local)
+        .join("org.windirstat.liquidglass")
+        .join("EBWebView")
+        .join("lockfile");
+    if !lockfile.exists() {
+        return false;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&lockfile)
+        .is_err()
+}
+
+#[cfg(windows)]
+fn prepare_webview2_isolation() -> WebView2IsolationGuard {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let mutex_name: Vec<u16> = "Local\\WinDirStatLiquidGlass_PrimaryWebView2\0"
+        .encode_utf16()
+        .collect();
+    let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
+    let mutex_taken =
+        !mutex_handle.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+
+    let mut temp_data_dir = None;
+    if env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none()
+        && (mutex_taken || is_default_webview2_locked())
+    {
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            let session_dir = PathBuf::from(local)
+                .join("org.windirstat.liquidglass")
+                .join(format!("session-{}", std::process::id()));
+            let _ = fs::create_dir_all(&session_dir);
+            env::set_var("WEBVIEW2_USER_DATA_FOLDER", &session_dir);
+            temp_data_dir = Some(session_dir);
+        }
+    }
+
+    WebView2IsolationGuard {
+        mutex_handle,
+        temp_data_dir,
+    }
+}
+
+fn run_embedded_self_check() -> Result<(), String> {
+    if !cfg!(feature = "custom-protocol") {
+        return Err("custom-protocol feature is disabled; offline UI assets are not embedded".into());
+    }
+
+    let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    let html_bytes = context
+        .assets()
+        .get(&"index.html".into())
+        .ok_or_else(|| "embedded index.html asset missing from tauri context".to_string())?;
+    let html = String::from_utf8_lossy(&html_bytes);
+
+    if !html.contains("WinDirStat Liquid Glass") {
+        return Err("embedded index.html missing expected title".into());
+    }
+    if !html.contains("/assets/index-") {
+        return Err("embedded index.html missing compiled Vite asset bundle reference".into());
+    }
+
+    println!(
+        "WinDirStat-LiquidGlass self-check OK: custom-protocol=true, index.html={} bytes",
+        html_bytes.len()
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -116,6 +218,17 @@ async fn purge_vault_item(_id: String) -> Option<()> {
 }
 
 fn main() {
+    if env::args().any(|arg| arg == "--self-check") {
+        if let Err(err) = run_embedded_self_check() {
+            eprintln!("Self-check FAILED: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    #[cfg(windows)]
+    let _wv2_guard = prepare_webview2_isolation();
+
     let app_dir = default_app_data_dir();
     let _ = fs::create_dir_all(&app_dir);
 
