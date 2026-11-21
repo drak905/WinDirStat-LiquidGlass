@@ -122,3 +122,26 @@ body,
 .glass-scroll::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.54);
 }
+
+/* Readable Markdown prose selection & table/blockquote spacing inside glass panels */
+.markdown-body ::selection {
+  background: rgba(56, 189, 248, 0.32);
+}
+
+.markdown-body blockquote > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body th:first-child,
+.markdown-body td:first-child {
+  padding-left: 0.9rem;
+}
+
+.markdown-body th:last-child,
+.markdown-body td:last-child {
+  padding-right: 0.9rem;
+}

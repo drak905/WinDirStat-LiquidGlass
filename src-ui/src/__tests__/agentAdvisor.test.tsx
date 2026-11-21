@@ -1,10 +1,13 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentAdvisorPanel } from '../components/AgentAdvisorPanel';
 import type { AgentAdvisorResponse, AgentProvider } from '../types/storage';
 
 describe('Agent CLI Storage Advisor Chat', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
   it('supports all 6 CLI providers and renders structured verdict, risk gauge, reclaimable bytes, usage assessment, >=3 verified URLs, and 1-click quarantine', async () => {
     const onQuarantine = vi.fn(async () => {});
     const onAsk = vi.fn(
@@ -273,5 +276,76 @@ describe('Agent CLI Storage Advisor Chat', () => {
     expect(screen.getByTestId('agent-streaming-banner')).toHaveTextContent(
       /Running\s+kiro-cli\s+CLI.*\(0s\)/
     );
+  });
+
+  it('renders Markdown headings, tables, code paths inside agent-markdown-body and copies full reply', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      configurable: true,
+    });
+    const markdownReply = [
+      '## Drive C Cleanup Summary',
+      '',
+      'Inspect `C:\\Users\\thinh\\AppData\\Local\\pip\\Cache` before deleting system files.',
+      '',
+      '| Location | Reclaimable | Safety |',
+      '| --- | --- | --- |',
+      '| `pip\\Cache` | 2.1 GB | Safe to delete |',
+      '| `WinSxS` | 9.4 GB | Do not delete |',
+      '',
+      '```powershell',
+      'pip cache purge',
+      '```',
+    ].join('\n');
+
+    const chatResp: AgentAdvisorResponse = {
+      id: 'kiro-md-1',
+      targetPath: 'C:\\',
+      targetName: 'Drive C',
+      targetSizeBytes: 0,
+      provider: 'kiro',
+      verdict: 'REVIEW_CAREFULLY',
+      risk_score: 0,
+      reclaimable_bytes: 0,
+      usage_value_assessment: markdownReply,
+      rationale: 'Live reply from kiro-cli.exe',
+      sources: [],
+      createdAt: new Date().toISOString(),
+      userPrompt: 'Analyze disk C for me',
+      responseMode: 'chat',
+      assistantReply: markdownReply,
+      isLiveCli: true,
+      resolvedCommand: 'kiro-cli.exe',
+      durationMs: 12400,
+    };
+
+    render(
+      <AgentAdvisorPanel
+        providers={[
+          { provider: 'kiro', displayName: 'Kiro CLI', available: true, command: 'kiro-cli', latencyMs: 32 },
+        ]}
+        selectedProvider="kiro"
+        onProviderChange={() => {}}
+        responses={[chatResp]}
+        isStreaming={false}
+        onSendPrompt={async () => {}}
+        onQuarantineRecommended={async () => {}}
+      />
+    );
+
+    const mdBody = screen.getByTestId('agent-markdown-body');
+    expect(within(mdBody).getByRole('heading', { level: 2, name: 'Drive C Cleanup Summary' })).toBeInTheDocument();
+    expect(mdBody.querySelector('table')).not.toBeNull();
+    expect(mdBody.querySelector('code')).not.toBeNull();
+    expect(within(mdBody).getByText('powershell')).toBeInTheDocument();
+
+    const copyReplyBtn = screen.getByTestId('agent-copy-reply-btn');
+    await user.click(copyReplyBtn);
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(markdownReply);
+    expect(screen.getByText('Copied Answer')).toBeInTheDocument();
   });
 });

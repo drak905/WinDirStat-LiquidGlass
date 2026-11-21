@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Bot,
   Send,
@@ -10,6 +10,8 @@ import {
   AlertTriangle,
   Sparkles,
   RefreshCw,
+  Copy,
+  Check,
 } from 'lucide-react';
 import type {
   AgentAdvisorResponse,
@@ -19,6 +21,7 @@ import type {
 } from '../types/storage';
 import { AGENT_PROVIDERS } from '../services/tauriBridge';
 import { formatBytes } from '../utils/formatters';
+import { copyTextToClipboard, MarkdownRenderer } from './MarkdownRenderer';
 
 const FALLBACK_OPENCODE_MODELS = [
   'opencode/big-pickle',
@@ -83,6 +86,16 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
   const [quarantinedIds, setQuarantinedIds] = useState<Record<string, boolean>>({});
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [copiedReplyId, setCopiedReplyId] = useState<string | null>(null);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) {
+        clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!isStreaming) {
@@ -124,6 +137,17 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
       await onRefreshProviders();
     } finally {
       setIsRefreshingProviders(false);
+    }
+  };
+
+  const handleCopyReply = async (id: string, text: string) => {
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
+      setCopiedReplyId(id);
+      if (copyTimerRef.current) {
+        clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = setTimeout(() => setCopiedReplyId(null), 2000);
     }
   };
 
@@ -433,6 +457,7 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
 
             if (mode === 'chat') {
               const replyBody = resp.assistantReply || resp.usage_value_assessment;
+              const isCopied = copiedReplyId === resp.id;
               return (
                 <article
                   key={resp.id}
@@ -440,18 +465,41 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
                   className="liquid-glass-card liquid-spring-enter rounded-3xl p-4"
                 >
                   {renderHeaderMeta()}
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-full border border-sky-400/40 bg-sky-500/20 px-2.5 py-0.5 text-[11px] font-bold tracking-wide text-sky-800 dark:text-sky-200">
-                      AGENT REPLY
-                    </span>
-                    <span className="rounded-lg bg-white/15 px-2 py-0.5 font-mono text-[10px] text-slate-700 dark:text-slate-300">
-                      provider: {resp.provider}
-                    </span>
-                    {renderLiveBadge()}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full border border-sky-400/40 bg-sky-500/20 px-2.5 py-0.5 text-[11px] font-bold tracking-wide text-sky-800 dark:text-sky-200">
+                        AGENT REPLY
+                      </span>
+                      <span className="rounded-lg bg-white/15 px-2 py-0.5 font-mono text-[10px] text-slate-700 dark:text-slate-300">
+                        provider: {resp.provider}
+                      </span>
+                      {renderLiveBadge()}
+                    </div>
+                    <button
+                      type="button"
+                      data-testid="agent-copy-reply-btn"
+                      onClick={() => void handleCopyReply(resp.id, replyBody)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/15 px-2.5 py-1 text-[11px] font-medium text-slate-700 transition hover:bg-white/25 dark:bg-black/25 dark:text-slate-200 dark:hover:bg-white/10"
+                    >
+                      {isCopied ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-500 dark:text-emerald-400" />
+                          <span>Copied Answer</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Copy Answer</span>
+                        </>
+                      )}
+                    </button>
                   </div>
 
-                  <div className="mt-3 whitespace-pre-wrap break-words rounded-2xl border border-white/15 bg-white/10 p-3 text-xs leading-relaxed text-slate-800 dark:bg-black/20 dark:text-slate-200">
-                    {replyBody}
+                  <div
+                    data-testid="agent-markdown-body"
+                    className="mt-3 rounded-2xl border border-white/15 bg-white/12 p-4 dark:bg-black/25"
+                  >
+                    <MarkdownRenderer content={replyBody} />
                   </div>
 
                   {resp.sources.length > 0 && renderSourcesGrid(resp.sources)}
@@ -511,16 +559,18 @@ export const AgentAdvisorPanel: React.FC<AgentAdvisorPanelProps> = ({
 
                 {/* Usage Value Assessment */}
                 <div className="mt-3 rounded-2xl border border-white/15 bg-white/10 p-3 text-xs dark:bg-black/20">
-                  <div className="mb-1 flex items-center gap-1.5 font-semibold text-slate-900 dark:text-white">
+                  <div className="mb-1.5 flex items-center gap-1.5 font-semibold text-slate-900 dark:text-white">
                     <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
                     Usage Value Assessment
                   </div>
-                  <p className="whitespace-pre-wrap break-words leading-relaxed text-slate-700 dark:text-slate-300">
-                    {resp.usage_value_assessment}
-                  </p>
-                  <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-600 dark:text-slate-400">
-                    {resp.rationale}
-                  </p>
+                  <MarkdownRenderer content={resp.usage_value_assessment} compact />
+                  {resp.rationale && (
+                    <MarkdownRenderer
+                      content={resp.rationale}
+                      compact
+                      className="mt-1.5 opacity-85"
+                    />
+                  )}
                 </div>
 
                 {/* Verified Cross-Checked External Source URLs (>= 3) */}
