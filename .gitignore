@@ -49,6 +49,8 @@ scripts/detected-agent-clis.json
 # =====================================================================
 WinDirStat.ini
 WinDirStat-portable.ini
+WinDirStat-LiquidGlass-Data/
+portable.txt
 *cloud-connections*.json
 *s3-credentials*
 *azure-blob*
