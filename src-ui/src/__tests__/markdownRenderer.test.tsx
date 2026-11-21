@@ -113,4 +113,57 @@ describe('MarkdownRenderer', () => {
     expect(screen.getByText('Ignore XSS')).toBeInTheDocument();
     expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
   });
+
+  it('renders real kiro-cli cleanup tables with bold category pills and wraps long bare URLs cleanly', () => {
+    const kiroSample = [
+      "I'll verify the public sources for the top cleanup targets first.",
+      '## C: cleanup advice (13.52 GiB free of 190.63 GiB, 92.9% used)',
+      '',
+      'Only sizes from the scan are used. Folders marked "+" are lower bounds.',
+      '',
+      '| Priority | Category | Target | Size | Action |',
+      '|---|---|---|---|---|',
+      '| 1 | **Safe to Quarantine** | `C:\\Users\\thinh\\Downloads` | 857.68 MiB (471 files) | Review installers and ISOs. |',
+      '| 3 | **Safe to Quarantine** | `C:\\hãy xem qua trang web này và tôi muốn tạo ssh priv.pdf` | 643 KB | Open it first. |',
+      '| 4 | **Clean via Official Tool** | `C:\\Users\\thinh\\AppData\\Local\\pip\\Cache` | 336.26 MiB+ | Run `py -m pip cache purge`. |',
+      '| 11 | **Keep Critical** | `C:\\EFI`, `C:\\$Windows.~WS` | 33.40 MiB, 751 KB | Leave them alone. |',
+      '',
+      '## Verified sources',
+      '- Microsoft page file guidance: https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/how-to-determine-the-appropriate-page-file-size-for-64-bit-versions-of-windows',
+    ].join('\n');
+
+    render(<MarkdownRenderer content={kiroSample} />);
+
+    expect(
+      screen.getByRole('heading', {
+        level: 2,
+        name: 'C: cleanup advice (13.52 GiB free of 190.63 GiB, 92.9% used)',
+      })
+    ).toBeInTheDocument();
+
+    const safePill = screen.getAllByText('Safe to Quarantine')[0].closest('span');
+    const cleanPill = screen.getByText('Clean via Official Tool').closest('span');
+    const keepPill = screen.getByText('Keep Critical').closest('span');
+
+    expect(safePill?.className).toContain('bg-emerald-500');
+    expect(safePill?.className).toContain('whitespace-nowrap');
+    expect(safePill?.className).toContain('[&_strong]:text-current');
+    expect(cleanPill?.className).toContain('bg-sky-500');
+    expect(cleanPill?.className).toContain('whitespace-nowrap');
+    expect(keepPill?.className).toContain('bg-rose-500');
+    expect(keepPill?.className).toContain('whitespace-nowrap');
+
+    expect(screen.getByText('C:\\$Windows.~WS').tagName).toBe('CODE');
+    expect(
+      screen.getByText('C:\\hãy xem qua trang web này và tôi muốn tạo ssh priv.pdf').tagName
+    ).toBe('CODE');
+
+    const bareLink = screen.getByRole('link', {
+      name: /learn\.microsoft\.com\/en-us\/troubleshoot\/windows-client\/performance\/how-to-determine-the-appropriate-page-file-size-for-64-bit-versions-of-windows/,
+    });
+    expect(bareLink).toHaveAttribute('target', '_blank');
+    expect(bareLink).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(bareLink.className).toContain('[overflow-wrap:anywhere]');
+    expect(bareLink.className).not.toContain('inline-flex');
+  });
 });

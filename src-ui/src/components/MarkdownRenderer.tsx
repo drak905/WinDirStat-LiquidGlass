@@ -73,9 +73,12 @@ function extractPlainText(node: React.ReactNode): string {
 
 function getSafetyBadgeClass(rawText: string): string | null {
   const text = rawText.trim();
-  if (!text || text.length > 28) return null;
-  if (/^(safe|safe to (delete|remove|clean)|low risk|yes\b)/i.test(text)) {
+  if (!text || text.length > 32) return null;
+  if (/^(safe|safe to (delete|remove|clean|quarantine)|low risk|yes\b)/i.test(text)) {
     return 'border-emerald-500/35 bg-emerald-500/18 text-emerald-800 dark:border-emerald-400/35 dark:bg-emerald-500/20 dark:text-emerald-200';
+  }
+  if (/^(clean via|official tool|use official)/i.test(text)) {
+    return 'border-sky-500/35 bg-sky-500/18 text-sky-800 dark:border-sky-400/35 dark:bg-sky-500/20 dark:text-sky-200';
   }
   if (/^(caution|review|review carefully|medium risk|conditional)/i.test(text)) {
     return 'border-amber-500/40 bg-amber-500/18 text-amber-900 dark:border-amber-400/35 dark:bg-amber-500/20 dark:text-amber-200';
@@ -255,7 +258,7 @@ function createMarkdownComponents(compact: boolean): Components {
       <tbody className="divide-y divide-slate-900/8 dark:divide-white/8">{children}</tbody>
     ),
     tr: ({ children }) => (
-      <tr className="transition-colors hover:bg-sky-500/8 dark:hover:bg-sky-400/10">
+      <tr className="even:bg-slate-900/[0.03] transition-colors hover:bg-sky-500/8 dark:even:bg-white/[0.025] dark:hover:bg-sky-400/10">
         {children}
       </tr>
     ),
@@ -269,7 +272,7 @@ function createMarkdownComponents(compact: boolean): Components {
         <td className="px-3 py-2 align-top break-words">
           {badgeClass ? (
             <span
-              className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${badgeClass}`}
+              className={`inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-semibold [&_strong]:text-current ${badgeClass}`}
             >
               {children}
             </span>
@@ -293,10 +296,13 @@ function createMarkdownComponents(compact: boolean): Components {
           href={safeHref}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-baseline gap-1 font-medium text-sky-700 underline decoration-sky-500/45 underline-offset-2 transition hover:text-sky-600 hover:decoration-sky-400 dark:text-sky-300 dark:hover:text-sky-200"
+          className="inline break-words font-medium text-sky-700 underline decoration-sky-500/45 underline-offset-2 transition [overflow-wrap:anywhere] hover:text-sky-600 hover:decoration-sky-400 dark:text-sky-300 dark:hover:text-sky-200"
         >
           <span>{children}</span>
-          <ExternalLink aria-hidden="true" className="inline h-3 w-3 shrink-0 self-center opacity-75" />
+          <ExternalLink
+            aria-hidden="true"
+            className="ml-0.5 inline h-3 w-3 align-text-top opacity-75"
+          />
         </a>
       );
     },
